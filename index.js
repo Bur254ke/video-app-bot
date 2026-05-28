@@ -5,7 +5,15 @@ const supabase = require("./supabase");
 const communities = require("./communities");
 
 const app = express();
-app.use(express.json());
+app.use(express.json());const APP_SECRET = process.env.APP_SECRET || "";
+
+app.use("/api", (req, res, next) => {
+  const secret = req.headers["x-app-secret"];
+  if (APP_SECRET && secret !== APP_SECRET) {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
+  next();
+});
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
