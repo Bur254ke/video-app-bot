@@ -1,11 +1,18 @@
 require("dotenv").config();
 const express = require("express");
 const fetch = require("node-fetch");
+const cors = require("cors");
 const supabase = require("./supabase");
 const communities = require("./communities");
 
 const app = express();
-app.use(express.json());const APP_SECRET = process.env.APP_SECRET || "";
+app.use(express.json());
+app.use(cors({
+  origin: ["https://video-app-web-one.vercel.app", "http://localhost:3000"],
+  methods: ["GET", "POST", "DELETE"],
+}));
+
+const APP_SECRET = process.env.APP_SECRET || "";
 
 app.use("/api", (req, res, next) => {
   const secret = req.headers["x-app-secret"];
