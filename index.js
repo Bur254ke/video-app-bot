@@ -237,8 +237,8 @@ app.post("/api/videos/:id/like", async (req, res) => {
 
   // Like
   await supabase.from("likes").insert({ video_id: id, session_id });
-  await supabase.from("videos").update({ likes_count: supabase.raw("likes_count + 1") }).eq("id", id);
-  res.json({ liked: true });
+  const { data: vid } = await supabase.from("videos").select("likes_count").eq("id", id).single();
+  await supabase.from("videos").update({ likes_count: (vid?.likes_count || 0) + 1 }).eq("id", id);
 });
 
 // Get like count for a video
@@ -251,3 +251,4 @@ app.listen(PORT, async () => {
   console.log(`🔐 Admin token: ${ADMIN_SECRET}`);
   await registerWebhook();
 });
+
