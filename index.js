@@ -246,6 +246,35 @@ app.get("/api/videos/:id/likes", async (req, res) => {
   const { data } = await supabase.from("likes").select("id").eq("video_id", req.params.id);
   res.json({ count: data?.length || 0 });
 });
+// Auto-cleanup dead videos every hour
+async function cleanupDeadVideos() {
+  console.log("🧹 Running video cleanup...");
+  const { data: videos } = await supabase.from("videos").select("id, video_url, file_id");
+  if (!videos) return;
+  let deleted = 0;
+  for (const video of videos) {
+    try {
+      const res = await fetch(video.video_url, { method: "HEAD" });
+      if (res.status === 404 || res.status === 403) {
+        // Try to refresh URL first
+        const freshUrl = await getFreshVideoUrl(video.file_id);
+        if (!freshUrl) {
+          await supabase.from("videos").delete().eq("id", video.id);
+          deleted++;
+          console.log(`🗑️ Deleted dead video: ${video.id}`);
+        } else {
+          await supabase.from("videos").update({ video_url: freshUrl }).eq("id", video.id);
+        }
+      }
+    } catch (e) { continue; }
+  }
+  console.log(`✅ Cleanup done — removed ${deleted} dead videos`);
+}
+
+// Run cleanup every hour
+setInterval(cleanupDeadVideos, 60 * 60 * 1000);
+// Run once on startup after 2 minutes
+setTimeout(cleanupDeadVideos, 2 * 60 * 1000);
 app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🔐 Admin token: ${ADMIN_SECRET}`);
