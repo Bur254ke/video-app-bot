@@ -132,7 +132,8 @@ app.get("/admin/stats", adminAuth, async (req, res) => {
   const { data: videos } = await supabase.from("videos").select("community");
   const { data: users } = await supabase.from("users").select("id");
   const { data: analytics } = await supabase.from("analytics").select("*");
-
+  const { data: appOpens } = await supabase.from("analytics").select("country").eq("event", "app_open");
+  const uniqueUsers = new Set(appOpens?.map(a => a.country)).size;
   const communityCount = {};
   videos?.forEach((v) => { communityCount[v.community] = (communityCount[v.community] || 0) + 1; });
   const mostActive = Object.entries(communityCount).sort((a, b) => b[1] - a[1])[0];
@@ -153,7 +154,7 @@ app.get("/admin/stats", adminAuth, async (req, res) => {
   });
   const topCountries = Object.entries(countries).sort((a, b) => b[1] - a[1]).slice(0, 5);
 
-  res.json({
+  res.json({app_users: uniqueUsers,
     total_videos: videos?.length || 0,
     total_users: users?.length || 0,
     videos_by_community: communityCount,
