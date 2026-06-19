@@ -66,6 +66,30 @@ async function refreshVideoUrls(videos) {
   );
 }
 
+// Auto-cleanup dead videos every hour
+async function cleanupDeadVideos() {
+  console.log("🧹 Running video cleanup...");
+  const { data: videos } = await supabase.from("videos").select("id, video_url, file_id");
+  if (!videos) return;
+  let deleted = 0;
+  for (const video of videos) {
+    try {
+      const res = await fetch(video.video_url, { method: "HEAD" });
+      if (res.status === 404 || res.status === 403) {
+        const freshUrl = await getFreshVideoUrl(video.file_id);
+        if (!freshUrl) {
+          await supabase.from("videos").delete().eq("id", video.id);
+          deleted++;
+          console.log(`🗑️ Deleted dead video: ${video.id}`);
+        } else {
+          await supabase.from("videos").update({ video_url: freshUrl }).eq("id", video.id);
+        }
+      }
+    } catch (e) { continue; }
+  }
+  console.log(`✅ Cleanup done — removed ${deleted} dead videos`);
+}
+
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
   const update = req.body;
@@ -78,6 +102,20 @@ app.post("/webhook", async (req, res) => {
   const file_id = video.file_id;
   const caption = message.caption || "";
   const thumbnail_file_id = video.thumbnail?.file_id || null;
+
+  // Prevent duplicate inserts of the same file_id in the same community
+  const { data: existing } = await supabase
+    .from("videos")
+    .select("id")
+    .eq("file_id", file_id)
+    .eq("community", community)
+    .maybeSingle();
+
+  if (existing) {
+    console.log(`⚠️ Duplicate video skipped: ${file_id}`);
+    return;
+  }
+
   console.log(`🎬 New video in [${community}]`);
   const video_url = await getFreshVideoUrl(file_id);
   const thumbnail_url = thumbnail_file_id ? await getFreshVideoUrl(thumbnail_file_id) : null;
@@ -128,6 +166,37 @@ app.post("/api/track", async (req, res) => {
   res.json({ success: true });
 });
 
+// Like a video
+app.post("/api/videos/:id/like", async (req, res) => {
+  const { id } = req.params;
+  const { session_id } = req.body;
+  if (!session_id) return res.status(400).json({ error: "Missing session_id" });
+
+  const { data: existing } = await supabase
+    .from("likes")
+    .select("id")
+    .eq("video_id", id)
+    .eq("session_id", session_id)
+    .single();
+
+  if (existing) {
+    await supabase.from("likes").delete().eq("video_id", id).eq("session_id", session_id);
+    await supabase.rpc("decrement_likes", { video_id: id });
+    return res.json({ liked: false });
+  }
+
+  await supabase.from("likes").insert({ video_id: id, session_id });
+  const { data: vid } = await supabase.from("videos").select("likes_count").eq("id", id).single();
+  await supabase.from("videos").update({ likes_count: (vid?.likes_count || 0) + 1 }).eq("id", id);
+  res.json({ liked: true });
+});
+
+// Get like count for a video
+app.get("/api/videos/:id/likes", async (req, res) => {
+  const { data } = await supabase.from("likes").select("id").eq("video_id", req.params.id);
+  res.json({ count: data?.length || 0 });
+});
+
 app.get("/admin/stats", adminAuth, async (req, res) => {
   const { data: videos } = await supabase.from("videos").select("community");
   const { data: users } = await supabase.from("users").select("id");
@@ -154,7 +223,8 @@ app.get("/admin/stats", adminAuth, async (req, res) => {
   });
   const topCountries = Object.entries(countries).sort((a, b) => b[1] - a[1]).slice(0, 5);
 
-  res.json({app_users: uniqueUsers,
+  res.json({
+    app_users: uniqueUsers,
     total_videos: videos?.length || 0,
     total_users: users?.length || 0,
     videos_by_community: communityCount,
@@ -215,70 +285,12 @@ app.post("/admin/announcement", adminAuth, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 4000;
-// Like a video
-app.post("/api/videos/:id/like", async (req, res) => {
-  const { id } = req.params;
-  const { session_id } = req.body;
-  if (!session_id) return res.status(400).json({ error: "Missing session_id" });
-
-  // Check if already liked
-  const { data: existing } = await supabase
-    .from("likes")
-    .select("id")
-    .eq("video_id", id)
-    .eq("session_id", session_id)
-    .single();
-
-  if (existing) {
-    // Unlike
-    await supabase.from("likes").delete().eq("video_id", id).eq("session_id", session_id);
-    await supabase.rpc("decrement_likes", { video_id: id });
-    return res.json({ liked: false });
-  }
-
-  // Like
-  await supabase.from("likes").insert({ video_id: id, session_id });
-  const { data: vid } = await supabase.from("videos").select("likes_count").eq("id", id).single();
-  await supabase.from("videos").update({ likes_count: (vid?.likes_count || 0) + 1 }).eq("id", id);
-});
-
-// Get like count for a video
-app.get("/api/videos/:id/likes", async (req, res) => {
-  const { data } = await supabase.from("likes").select("id").eq("video_id", req.params.id);
-  res.json({ count: data?.length || 0 });
-});
-// Auto-cleanup dead videos every hour
-async function cleanupDeadVideos() {
-  console.log("🧹 Running video cleanup...");
-  const { data: videos } = await supabase.from("videos").select("id, video_url, file_id");
-  if (!videos) return;
-  let deleted = 0;
-  for (const video of videos) {
-    try {
-      const res = await fetch(video.video_url, { method: "HEAD" });
-      if (res.status === 404 || res.status === 403) {
-        // Try to refresh URL first
-        const freshUrl = await getFreshVideoUrl(video.file_id);
-        if (!freshUrl) {
-          await supabase.from("videos").delete().eq("id", video.id);
-          deleted++;
-          console.log(`🗑️ Deleted dead video: ${video.id}`);
-        } else {
-          await supabase.from("videos").update({ video_url: freshUrl }).eq("id", video.id);
-        }
-      }
-    } catch (e) { continue; }
-  }
-  console.log(`✅ Cleanup done — removed ${deleted} dead videos`);
-}
-
-// Run cleanup every hour
-setInterval(cleanupDeadVideos, 60 * 60 * 1000);
-// Run once on startup after 2 minutes
-setTimeout(cleanupDeadVideos, 2 * 60 * 1000);
 app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🔐 Admin token: ${ADMIN_SECRET}`);
   await registerWebhook();
+  // Run cleanup once on startup after 2 minutes
+  setTimeout(cleanupDeadVideos, 2 * 60 * 1000);
+  // Run cleanup every hour
+  setInterval(cleanupDeadVideos, 60 * 60 * 1000);
 });
-
