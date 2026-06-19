@@ -8,7 +8,7 @@ const communities = require("./communities");
 const app = express();
 app.use(express.json());
 app.use(cors({
-  origin: ["https://video-app-web-one.vercel.app", "http://localhost:3000"],
+  origin: ["https://foxyalexx.xyz", "https://www.foxyalexx.xyz", "https://video-app-web-one.vercel.app", "http://localhost:3000"],
   methods: ["GET", "POST", "DELETE"],
 }));
 
