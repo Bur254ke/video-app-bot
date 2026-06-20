@@ -90,6 +90,46 @@ async function cleanupDeadVideos() {
   console.log(`✅ Cleanup done — removed ${deleted} dead videos`);
 }
 
+// Send push notification to all registered devices
+async function sendPushToAll(title, body, data = {}) {
+  const { data: tokens } = await supabase.from("push_tokens").select("push_token");
+  if (!tokens || tokens.length === 0) {
+    console.log("📵 No push tokens registered");
+    return;
+  }
+
+  const messages = tokens.map(t => ({
+    to: t.push_token,
+    sound: "default",
+    title,
+    body,
+    data,
+  }));
+
+  // Expo push API accepts batches of up to 100
+  const chunks = [];
+  for (let i = 0; i < messages.length; i += 100) {
+    chunks.push(messages.slice(i, i + 100));
+  }
+
+  for (const chunk of chunks) {
+    try {
+      await fetch("https://exp.host/--/api/v2/push/send", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+          "Accept-Encoding": "gzip, deflate",
+        },
+        body: JSON.stringify(chunk),
+      });
+    } catch (e) {
+      console.error("Push send error:", e.message);
+    }
+  }
+  console.log(`📲 Sent push to ${messages.length} devices`);
+}
+
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
   const update = req.body;
@@ -120,17 +160,19 @@ app.post("/webhook", async (req, res) => {
   const video_url = await getFreshVideoUrl(file_id);
   const thumbnail_url = thumbnail_file_id ? await getFreshVideoUrl(thumbnail_file_id) : null;
   const { error } = await supabase.from("videos").insert({ community, file_id, video_url, thumbnail_url, caption });
-  if (error) {console.error("❌ Supabase error:", error.message);
-} else {
-  console.log(`✅ Saved → community: ${community}`);
-  // Notify users of new video
-  const communityLabels = { haul: "Femboys", haul2: "Trending" };
-  sendPushToAll(
-    "🦊 New video on Foxy Alexx!",
-    `Fresh content just dropped in ${communityLabels[community] || community}`,
-    { community, label: communityLabels[community], emoji: community === "haul" ? "🌸" : "🔥" }
-  );
-}
+  if (error) {
+    console.error("❌ Supabase error:", error.message);
+  } else {
+    console.log(`✅ Saved → community: ${community}`);
+    // Notify users of new video
+    const communityLabels = { haul: "Femboys", haul2: "Trending" };
+    sendPushToAll(
+      "🦊 New video on Foxy Alexx!",
+      `Fresh content just dropped in ${communityLabels[community] || community}`,
+      { community, label: communityLabels[community], emoji: community === "haul" ? "🌸" : "🔥" }
+    );
+  }
+});
 
 app.get("/", (req, res) => res.json({ status: "ok", message: "Foxy Alexx bot running 🚀" }));
 
@@ -182,45 +224,6 @@ app.post("/api/push-token", async (req, res) => {
   }
 });
 
-// Send push notification to all registered devices
-async function sendPushToAll(title, body, data = {}) {
-  const { data: tokens } = await supabase.from("push_tokens").select("push_token");
-  if (!tokens || tokens.length === 0) {
-    console.log("📵 No push tokens registered");
-    return;
-  }
-
-  const messages = tokens.map(t => ({
-    to: t.push_token,
-    sound: "default",
-    title,
-    body,
-    data,
-  }));
-
-  // Expo push API accepts batches of up to 100
-  const chunks = [];
-  for (let i = 0; i < messages.length; i += 100) {
-    chunks.push(messages.slice(i, i + 100));
-  }
-
-  for (const chunk of chunks) {
-    try {
-      await fetch("https://exp.host/--/api/v2/push/send", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json",
-          "Accept-Encoding": "gzip, deflate",
-        },
-        body: JSON.stringify(chunk),
-      });
-    } catch (e) {
-      console.error("Push send error:", e.message);
-    }
-  }
-  console.log(`📲 Sent push to ${messages.length} devices`);
-}
 app.post("/api/track", async (req, res) => {
   const { event, platform, community, country } = req.body;
   await trackEvent(event || "unknown", platform || "unknown", community || "unknown", country || "unknown");
