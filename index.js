@@ -120,9 +120,17 @@ app.post("/webhook", async (req, res) => {
   const video_url = await getFreshVideoUrl(file_id);
   const thumbnail_url = thumbnail_file_id ? await getFreshVideoUrl(thumbnail_file_id) : null;
   const { error } = await supabase.from("videos").insert({ community, file_id, video_url, thumbnail_url, caption });
-  if (error) console.error("❌ Supabase error:", error.message);
-  else console.log(`✅ Saved → community: ${community}`);
-});
+  if (error) {console.error("❌ Supabase error:", error.message);
+} else {
+  console.log(`✅ Saved → community: ${community}`);
+  // Notify users of new video
+  const communityLabels = { haul: "Femboys", haul2: "Trending" };
+  sendPushToAll(
+    "🦊 New video on Foxy Alexx!",
+    `Fresh content just dropped in ${communityLabels[community] || community}`,
+    { community, label: communityLabels[community], emoji: community === "haul" ? "🌸" : "🔥" }
+  );
+}
 
 app.get("/", (req, res) => res.json({ status: "ok", message: "Foxy Alexx bot running 🚀" }));
 
@@ -159,7 +167,60 @@ app.get("/api/settings", async (req, res) => {
   data.forEach((row) => { settings[row.key] = row.value; });
   res.json(settings);
 });
+   // Store push token
+app.post("/api/push-token", async (req, res) => {
+  const { push_token, platform } = req.body;
+  if (!push_token) return res.status(400).json({ error: "Missing push_token" });
+  try {
+    await supabase.from("push_tokens").upsert(
+      { push_token, platform },
+      { onConflict: "push_token" }
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
+// Send push notification to all registered devices
+async function sendPushToAll(title, body, data = {}) {
+  const { data: tokens } = await supabase.from("push_tokens").select("push_token");
+  if (!tokens || tokens.length === 0) {
+    console.log("📵 No push tokens registered");
+    return;
+  }
+
+  const messages = tokens.map(t => ({
+    to: t.push_token,
+    sound: "default",
+    title,
+    body,
+    data,
+  }));
+
+  // Expo push API accepts batches of up to 100
+  const chunks = [];
+  for (let i = 0; i < messages.length; i += 100) {
+    chunks.push(messages.slice(i, i + 100));
+  }
+
+  for (const chunk of chunks) {
+    try {
+      await fetch("https://exp.host/--/api/v2/push/send", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+          "Accept-Encoding": "gzip, deflate",
+        },
+        body: JSON.stringify(chunk),
+      });
+    } catch (e) {
+      console.error("Push send error:", e.message);
+    }
+  }
+  console.log(`📲 Sent push to ${messages.length} devices`);
+}
 app.post("/api/track", async (req, res) => {
   const { event, platform, community, country } = req.body;
   await trackEvent(event || "unknown", platform || "unknown", community || "unknown", country || "unknown");
@@ -284,6 +345,29 @@ app.post("/admin/announcement", adminAuth, async (req, res) => {
   res.json({ success: true, announcement: message });
 });
 
+// Daily reminder notification at a fixed time
+function scheduleDailyReminder() {
+  const now = new Date();
+  const target = new Date();
+  target.setHours(19, 0, 0, 0); // 7 PM daily
+  if (target <= now) target.setDate(target.getDate() + 1);
+  const msUntilTarget = target - now;
+  setTimeout(() => {
+    sendPushToAll(
+      "🦊 Don't miss out!",
+      "New videos are waiting for you on Foxy Alexx. Tap to watch now!",
+      { community: "haul" }
+    );
+    setInterval(() => {
+      sendPushToAll(
+        "🦊 Don't miss out!",
+        "New videos are waiting for you on Foxy Alexx. Tap to watch now!",
+        { community: "haul" }
+      );
+    }, 24 * 60 * 60 * 1000);
+  }, msUntilTarget);
+}
+
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
@@ -293,4 +377,5 @@ app.listen(PORT, async () => {
   setTimeout(cleanupDeadVideos, 2 * 60 * 1000);
   // Run cleanup every hour
   setInterval(cleanupDeadVideos, 60 * 60 * 1000);
+  scheduleDailyReminder();
 });
