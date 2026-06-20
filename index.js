@@ -130,7 +130,8 @@ app.post("/webhook", async (req, res) => {
     `Fresh content just dropped in ${communityLabels[community] || community}`,
     { community, label: communityLabels[community], emoji: community === "haul" ? "🌸" : "🔥" }
   );
-}
+  }
+});
 
 app.get("/", (req, res) => res.json({ status: "ok", message: "Foxy Alexx bot running 🚀" }));
 
