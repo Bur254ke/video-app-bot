@@ -66,7 +66,6 @@ async function refreshVideoUrls(videos) {
   );
 }
 
-// Auto-cleanup dead videos every hour
 async function cleanupDeadVideos() {
   console.log("🧹 Running video cleanup...");
   const { data: videos } = await supabase.from("videos").select("id, video_url, file_id");
@@ -90,6 +89,27 @@ async function cleanupDeadVideos() {
   console.log(`✅ Cleanup done — removed ${deleted} dead videos`);
 }
 
+async function sendPushToAll(title, body, data = {}) {
+  const { data: tokens } = await supabase.from("push_tokens").select("push_token");
+  if (!tokens || tokens.length === 0) {
+    console.log("📵 No push tokens registered");
+    return;
+  }
+  const messages = tokens.map(t => ({ to: t.push_token, sound: "default", title, body, data }));
+  const chunks = [];
+  for (let i = 0; i < messages.length; i += 100) chunks.push(messages.slice(i, i + 100));
+  for (const chunk of chunks) {
+    try {
+      await fetch("https://exp.host/--/api/v2/push/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json", "Accept-Encoding": "gzip, deflate" },
+        body: JSON.stringify(chunk),
+      });
+    } catch (e) { console.error("Push send error:", e.message); }
+  }
+  console.log(`📲 Sent push to ${messages.length} devices`);
+}
+
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
   const update = req.body;
@@ -103,7 +123,6 @@ app.post("/webhook", async (req, res) => {
   const caption = message.caption || "";
   const thumbnail_file_id = video.thumbnail?.file_id || null;
 
-  // Prevent duplicate inserts of the same file_id in the same community
   const { data: existing } = await supabase
     .from("videos")
     .select("id")
@@ -120,16 +139,16 @@ app.post("/webhook", async (req, res) => {
   const video_url = await getFreshVideoUrl(file_id);
   const thumbnail_url = thumbnail_file_id ? await getFreshVideoUrl(thumbnail_file_id) : null;
   const { error } = await supabase.from("videos").insert({ community, file_id, video_url, thumbnail_url, caption });
-  if (error) {console.error("❌ Supabase error:", error.message);
-} else {
-  console.log(`✅ Saved → community: ${community}`);
-  // Notify users of new video
-  const communityLabels = { haul: "Femboys", haul2: "Trending" };
-  sendPushToAll(
-    "🦊 New video on Foxy Alexx!",
-    `Fresh content just dropped in ${communityLabels[community] || community}`,
-    { community, label: communityLabels[community], emoji: community === "haul" ? "🌸" : "🔥" }
-  );
+  if (error) {
+    console.error("❌ Supabase error:", error.message);
+  } else {
+    console.log(`✅ Saved → community: ${community}`);
+    const communityLabels = { haul: "Femboys", haul2: "Trending" };
+    sendPushToAll(
+      "🦊 New video on Foxy Alexx!",
+      `Fresh content just dropped in ${communityLabels[community] || community}`,
+      { community, label: communityLabels[community], emoji: community === "haul" ? "🌸" : "🔥" }
+    );
   }
 });
 
@@ -168,67 +187,24 @@ app.get("/api/settings", async (req, res) => {
   data.forEach((row) => { settings[row.key] = row.value; });
   res.json(settings);
 });
-   // Store push token
+
 app.post("/api/push-token", async (req, res) => {
   const { push_token, platform } = req.body;
   if (!push_token) return res.status(400).json({ error: "Missing push_token" });
   try {
-    await supabase.from("push_tokens").upsert(
-      { push_token, platform },
-      { onConflict: "push_token" }
-    );
+    await supabase.from("push_tokens").upsert({ push_token, platform }, { onConflict: "push_token" });
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Send push notification to all registered devices
-async function sendPushToAll(title, body, data = {}) {
-  const { data: tokens } = await supabase.from("push_tokens").select("push_token");
-  if (!tokens || tokens.length === 0) {
-    console.log("📵 No push tokens registered");
-    return;
-  }
-
-  const messages = tokens.map(t => ({
-    to: t.push_token,
-    sound: "default",
-    title,
-    body,
-    data,
-  }));
-
-  // Expo push API accepts batches of up to 100
-  const chunks = [];
-  for (let i = 0; i < messages.length; i += 100) {
-    chunks.push(messages.slice(i, i + 100));
-  }
-
-  for (const chunk of chunks) {
-    try {
-      await fetch("https://exp.host/--/api/v2/push/send", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json",
-          "Accept-Encoding": "gzip, deflate",
-        },
-        body: JSON.stringify(chunk),
-      });
-    } catch (e) {
-      console.error("Push send error:", e.message);
-    }
-  }
-  console.log(`📲 Sent push to ${messages.length} devices`);
-}
 app.post("/api/track", async (req, res) => {
   const { event, platform, community, country } = req.body;
   await trackEvent(event || "unknown", platform || "unknown", community || "unknown", country || "unknown");
   res.json({ success: true });
 });
 
-// Like a video
 app.post("/api/videos/:id/like", async (req, res) => {
   const { id } = req.params;
   const { session_id } = req.body;
@@ -253,7 +229,6 @@ app.post("/api/videos/:id/like", async (req, res) => {
   res.json({ liked: true });
 });
 
-// Get like count for a video
 app.get("/api/videos/:id/likes", async (req, res) => {
   const { data } = await supabase.from("likes").select("id").eq("video_id", req.params.id);
   res.json({ count: data?.length || 0 });
@@ -268,23 +243,13 @@ app.get("/admin/stats", adminAuth, async (req, res) => {
   const communityCount = {};
   videos?.forEach((v) => { communityCount[v.community] = (communityCount[v.community] || 0) + 1; });
   const mostActive = Object.entries(communityCount).sort((a, b) => b[1] - a[1])[0];
-
   const totalViews = analytics?.length || 0;
-  const todayViews = analytics?.filter(a =>
-    new Date(a.created_at) > new Date(Date.now() - 86400000)
-  ).length || 0;
-
+  const todayViews = analytics?.filter(a => new Date(a.created_at) > new Date(Date.now() - 86400000)).length || 0;
   const webViews = analytics?.filter(a => a.platform === "web").length || 0;
   const mobileViews = analytics?.filter(a => a.platform === "mobile").length || 0;
-
   const countries = {};
-  analytics?.forEach(a => {
-    if (a.country && a.country !== "unknown") {
-      countries[a.country] = (countries[a.country] || 0) + 1;
-    }
-  });
+  analytics?.forEach(a => { if (a.country && a.country !== "unknown") countries[a.country] = (countries[a.country] || 0) + 1; });
   const topCountries = Object.entries(countries).sort((a, b) => b[1] - a[1]).slice(0, 5);
-
   res.json({
     app_users: uniqueUsers,
     total_videos: videos?.length || 0,
@@ -346,13 +311,26 @@ app.post("/admin/announcement", adminAuth, async (req, res) => {
   res.json({ success: true, announcement: message });
 });
 
+function scheduleDailyReminder() {
+  const now = new Date();
+  const target = new Date();
+  target.setHours(19, 0, 0, 0);
+  if (target <= now) target.setDate(target.getDate() + 1);
+  const msUntilTarget = target - now;
+  setTimeout(() => {
+    sendPushToAll("🦊 Don't miss out!", "New videos are waiting for you on Foxy Alexx. Tap to watch now!", { community: "haul" });
+    setInterval(() => {
+      sendPushToAll("🦊 Don't miss out!", "New videos are waiting for you on Foxy Alexx. Tap to watch now!", { community: "haul" });
+    }, 24 * 60 * 60 * 1000);
+  }, msUntilTarget);
+}
+
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🔐 Admin token: ${ADMIN_SECRET}`);
   await registerWebhook();
-  // Run cleanup once on startup after 2 minutes
   setTimeout(cleanupDeadVideos, 2 * 60 * 1000);
-  // Run cleanup every hour
   setInterval(cleanupDeadVideos, 60 * 60 * 1000);
+  scheduleDailyReminder();
 });
