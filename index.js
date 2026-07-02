@@ -44,24 +44,39 @@ async function registerWebhook() {
   else console.error("❌ Webhook failed:", data.description);
 }
 
-async function getFreshVideoUrl(file_id) {
+async function tgGetFile(file_id) {
   try {
     const res = await fetch(`${TELEGRAM_API}/getFile?file_id=${file_id}`);
-    const data = await res.json();
-    if (!data.ok) return null;
-    return `https://api.telegram.org/file/bot${BOT_TOKEN}/${data.result.file_path}`;
-  } catch (e) { return null; }
+    return await res.json();
+  } catch (e) {
+    return { ok: false, description: e.message };
+  }
+}
+
+async function getFreshVideoUrl(file_id) {
+  const data = await tgGetFile(file_id);
+  if (!data.ok) return null;
+  return `https://api.telegram.org/file/bot${BOT_TOKEN}/${data.result.file_path}`;
+}
+
+// Telegram's Bot API caps file downloads at 20MB and returns a hard error for
+// anything bigger ("file is too big") — that is NOT the same as the file being
+// gone, and must never be treated as such by callers deciding whether to delete
+// a row. gone=true only for errors that mean Telegram no longer has this file.
+function isFileGoneFromTelegram(getFileResponse) {
+  const desc = (getFileResponse.description || "").toLowerCase();
+  return desc.includes("file not found") || desc.includes("wrong file_id") || desc.includes("file_id is invalid");
 }
 
 async function downloadTelegramFile(file_id) {
-  const url = await getFreshVideoUrl(file_id);
-  if (!url) return null;
+  const fileInfo = await tgGetFile(file_id);
+  if (!fileInfo.ok) return { buffer: null, gone: isFileGoneFromTelegram(fileInfo), reason: fileInfo.description };
   try {
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    return Buffer.from(await res.arrayBuffer());
+    const res = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`);
+    if (!res.ok) return { buffer: null, gone: res.status === 404, reason: `HTTP ${res.status}` };
+    return { buffer: Buffer.from(await res.arrayBuffer()), gone: false, reason: null };
   } catch (e) {
-    return null;
+    return { buffer: null, gone: false, reason: e.message };
   }
 }
 
@@ -77,21 +92,23 @@ function extensionFromMime(mime, fallback) {
 async function persistVideoAssets(community, file_id, thumbnail_file_id, mimeType) {
   const result = { video_url: null, thumbnail_url: null };
 
-  const videoBuffer = await downloadTelegramFile(file_id);
-  if (videoBuffer) {
+  const video = await downloadTelegramFile(file_id);
+  if (video.buffer) {
     try {
       const ext = extensionFromMime(mimeType, "mp4");
-      result.video_url = await uploadFile(`${community}/${file_id}.${ext}`, videoBuffer, mimeType || "video/mp4");
+      result.video_url = await uploadFile(`${community}/${file_id}.${ext}`, video.buffer, mimeType || "video/mp4");
     } catch (e) {
       console.error("❌ Video upload to storage failed:", e.message);
     }
+  } else if (video.reason) {
+    console.log(`⚠️ Could not fetch video ${file_id}: ${video.reason}`);
   }
 
   if (thumbnail_file_id) {
-    const thumbBuffer = await downloadTelegramFile(thumbnail_file_id);
-    if (thumbBuffer) {
+    const thumb = await downloadTelegramFile(thumbnail_file_id);
+    if (thumb.buffer) {
       try {
-        result.thumbnail_url = await uploadFile(`${community}/${file_id}_thumb.jpg`, thumbBuffer, "image/jpeg");
+        result.thumbnail_url = await uploadFile(`${community}/${file_id}_thumb.jpg`, thumb.buffer, "image/jpeg");
       } catch (e) {
         console.error("❌ Thumbnail upload to storage failed:", e.message);
       }
@@ -103,7 +120,10 @@ async function persistVideoAssets(community, file_id, thumbnail_file_id, mimeTyp
 
 // One-off (self-repeating) migration for videos saved before permanent storage
 // existed. Anything still pointing at a Telegram file link gets re-downloaded
-// and re-hosted; only rows Telegram truly no longer has are removed.
+// and re-hosted. A row is only ever removed when Telegram explicitly confirms
+// the file is gone (isFileGoneFromTelegram) — every other failure (too big,
+// rate limited, network blip, etc.) leaves the row untouched. Deleting on any
+// failure is exactly what caused every video to disappear in production once.
 async function migrateLegacyVideos() {
   const { data: videos } = await supabase.from("videos").select("id, community, video_url, file_id");
   if (!videos) return;
@@ -111,24 +131,29 @@ async function migrateLegacyVideos() {
   if (legacy.length === 0) return;
 
   console.log(`🔄 Migrating ${legacy.length} legacy video(s) to permanent storage...`);
-  let migrated = 0, deleted = 0;
+  let migrated = 0, deleted = 0, skipped = 0;
   for (const video of legacy) {
-    const buffer = await downloadTelegramFile(video.file_id);
-    if (!buffer) {
-      await supabase.from("videos").delete().eq("id", video.id);
-      deleted++;
-      console.log(`🗑️ Unrecoverable (gone from Telegram), removed: ${video.id}`);
+    const file = await downloadTelegramFile(video.file_id);
+    if (!file.buffer) {
+      if (file.gone) {
+        await supabase.from("videos").delete().eq("id", video.id);
+        deleted++;
+        console.log(`🗑️ Confirmed gone from Telegram, removed: ${video.id} (${file.reason})`);
+      } else {
+        skipped++;
+        console.log(`⏭️ Skipping ${video.id} for now — not deleting (${file.reason})`);
+      }
       continue;
     }
     try {
-      const url = await uploadFile(`${video.community}/${video.file_id}.mp4`, buffer, "video/mp4");
+      const url = await uploadFile(`${video.community}/${video.file_id}.mp4`, file.buffer, "video/mp4");
       await supabase.from("videos").update({ video_url: url }).eq("id", video.id);
       migrated++;
     } catch (e) {
       console.error(`❌ Migration upload failed for ${video.id}:`, e.message);
     }
   }
-  console.log(`✅ Migration done — migrated ${migrated}, removed ${deleted} unrecoverable`);
+  console.log(`✅ Migration done — migrated ${migrated}, removed ${deleted} confirmed-gone, skipped ${skipped}`);
 }
 
 async function sendPushToAll(title, body, data = {}) {
