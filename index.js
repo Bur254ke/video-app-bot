@@ -420,6 +420,21 @@ app.post("/admin/announcement", adminAuth, async (req, res) => {
   res.json({ success: true, announcement: message });
 });
 
+// Lets non-Telegram ingestion paths (e.g. the direct-uploader script) trigger
+// the same "new video" push notification the Telegram webhook sends.
+app.post("/admin/notify", adminAuth, async (req, res) => {
+  const { community, label } = req.body;
+  if (!community) return res.status(400).json({ error: "Missing community" });
+  const communityLabels = { haul: "Femboys", haul2: "Trending" };
+  const resolvedLabel = label || communityLabels[community] || community;
+  sendPushToAll(
+    "🦊 New video on Foxy Alexx!",
+    `Fresh content just dropped in ${resolvedLabel}`,
+    { community, label: resolvedLabel, emoji: community === "haul" ? "🌸" : "🔥" }
+  );
+  res.json({ success: true });
+});
+
 function scheduleDailyReminder() {
   const now = new Date();
   const target = new Date();
