@@ -4,6 +4,7 @@ const fetch = require("node-fetch");
 const cors = require("cors");
 const supabase = require("./supabase");
 const communities = require("./communities");
+const { uploadFile, isPermanentUrl } = require("./storage");
 
 const app = express();
 app.use(express.json());
@@ -52,41 +53,82 @@ async function getFreshVideoUrl(file_id) {
   } catch (e) { return null; }
 }
 
-async function refreshVideoUrls(videos) {
-  return await Promise.all(
-    videos.map(async (video) => {
-      if (!video.file_id) return video;
-      const freshUrl = await getFreshVideoUrl(video.file_id);
-      if (freshUrl) {
-        await supabase.from("videos").update({ video_url: freshUrl }).eq("id", video.id);
-        return { ...video, video_url: freshUrl };
-      }
-      return video;
-    })
-  );
+async function downloadTelegramFile(file_id) {
+  const url = await getFreshVideoUrl(file_id);
+  if (!url) return null;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    return Buffer.from(await res.arrayBuffer());
+  } catch (e) {
+    return null;
+  }
 }
 
-async function cleanupDeadVideos() {
-  console.log("🧹 Running video cleanup...");
-  const { data: videos } = await supabase.from("videos").select("id, video_url, file_id");
-  if (!videos) return;
-  let deleted = 0;
-  for (const video of videos) {
+function extensionFromMime(mime, fallback) {
+  if (!mime) return fallback;
+  const part = mime.split("/")[1];
+  return part ? part.split(";")[0] : fallback;
+}
+
+// Downloads the video (and thumbnail) from Telegram once and re-hosts them in
+// Supabase Storage, so playback no longer depends on the source message still
+// existing on Telegram (which is what was breaking videos on web + app).
+async function persistVideoAssets(community, file_id, thumbnail_file_id, mimeType) {
+  const result = { video_url: null, thumbnail_url: null };
+
+  const videoBuffer = await downloadTelegramFile(file_id);
+  if (videoBuffer) {
     try {
-      const res = await fetch(video.video_url, { method: "HEAD" });
-      if (res.status === 404 || res.status === 403) {
-        const freshUrl = await getFreshVideoUrl(video.file_id);
-        if (!freshUrl) {
-          await supabase.from("videos").delete().eq("id", video.id);
-          deleted++;
-          console.log(`🗑️ Deleted dead video: ${video.id}`);
-        } else {
-          await supabase.from("videos").update({ video_url: freshUrl }).eq("id", video.id);
-        }
-      }
-    } catch (e) { continue; }
+      const ext = extensionFromMime(mimeType, "mp4");
+      result.video_url = await uploadFile(`${community}/${file_id}.${ext}`, videoBuffer, mimeType || "video/mp4");
+    } catch (e) {
+      console.error("❌ Video upload to storage failed:", e.message);
+    }
   }
-  console.log(`✅ Cleanup done — removed ${deleted} dead videos`);
+
+  if (thumbnail_file_id) {
+    const thumbBuffer = await downloadTelegramFile(thumbnail_file_id);
+    if (thumbBuffer) {
+      try {
+        result.thumbnail_url = await uploadFile(`${community}/${file_id}_thumb.jpg`, thumbBuffer, "image/jpeg");
+      } catch (e) {
+        console.error("❌ Thumbnail upload to storage failed:", e.message);
+      }
+    }
+  }
+
+  return result;
+}
+
+// One-off (self-repeating) migration for videos saved before permanent storage
+// existed. Anything still pointing at a Telegram file link gets re-downloaded
+// and re-hosted; only rows Telegram truly no longer has are removed.
+async function migrateLegacyVideos() {
+  const { data: videos } = await supabase.from("videos").select("id, community, video_url, file_id");
+  if (!videos) return;
+  const legacy = videos.filter((v) => !isPermanentUrl(v.video_url));
+  if (legacy.length === 0) return;
+
+  console.log(`🔄 Migrating ${legacy.length} legacy video(s) to permanent storage...`);
+  let migrated = 0, deleted = 0;
+  for (const video of legacy) {
+    const buffer = await downloadTelegramFile(video.file_id);
+    if (!buffer) {
+      await supabase.from("videos").delete().eq("id", video.id);
+      deleted++;
+      console.log(`🗑️ Unrecoverable (gone from Telegram), removed: ${video.id}`);
+      continue;
+    }
+    try {
+      const url = await uploadFile(`${video.community}/${video.file_id}.mp4`, buffer, "video/mp4");
+      await supabase.from("videos").update({ video_url: url }).eq("id", video.id);
+      migrated++;
+    } catch (e) {
+      console.error(`❌ Migration upload failed for ${video.id}:`, e.message);
+    }
+  }
+  console.log(`✅ Migration done — migrated ${migrated}, removed ${deleted} unrecoverable`);
 }
 
 async function sendPushToAll(title, body, data = {}) {
@@ -136,8 +178,11 @@ app.post("/webhook", async (req, res) => {
   }
 
   console.log(`🎬 New video in [${community}]`);
-  const video_url = await getFreshVideoUrl(file_id);
-  const thumbnail_url = thumbnail_file_id ? await getFreshVideoUrl(thumbnail_file_id) : null;
+  const { video_url, thumbnail_url } = await persistVideoAssets(community, file_id, thumbnail_file_id, video.mime_type);
+  if (!video_url) {
+    console.error(`❌ Could not persist video ${file_id} to storage — skipping save`);
+    return;
+  }
   const { error } = await supabase.from("videos").insert({ community, file_id, video_url, thumbnail_url, caption });
   if (error) {
     console.error("❌ Supabase error:", error.message);
@@ -163,8 +208,7 @@ app.get("/api/videos/:community", async (req, res) => {
     .eq("community", req.params.community)
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
-  const fresh = await refreshVideoUrls(data);
-  res.json({ videos: fresh });
+  res.json({ videos: data });
 });
 
 app.get("/api/videos", async (req, res) => {
@@ -176,8 +220,7 @@ app.get("/api/videos", async (req, res) => {
     .order("created_at", { ascending: false })
     .limit(50);
   if (error) return res.status(500).json({ error: error.message });
-  const fresh = await refreshVideoUrls(data);
-  res.json({ videos: fresh });
+  res.json({ videos: data });
 });
 
 app.get("/api/settings", async (req, res) => {
@@ -234,8 +277,20 @@ app.get("/api/videos/:id/likes", async (req, res) => {
   res.json({ count: data?.length || 0 });
 });
 
+function dayKey(date) {
+  return new Date(date).toISOString().slice(0, 10);
+}
+
+function last7DayKeys() {
+  const days = [];
+  for (let i = 6; i >= 0; i--) {
+    days.push(dayKey(new Date(Date.now() - i * 86400000)));
+  }
+  return days;
+}
+
 app.get("/admin/stats", adminAuth, async (req, res) => {
-  const { data: videos } = await supabase.from("videos").select("community");
+  const { data: videos } = await supabase.from("videos").select("id, community, caption, likes_count, created_at");
   const { data: users } = await supabase.from("users").select("id");
   const { data: analytics } = await supabase.from("analytics").select("*");
   const { data: appOpens } = await supabase.from("analytics").select("country").eq("event", "app_open");
@@ -250,6 +305,24 @@ app.get("/admin/stats", adminAuth, async (req, res) => {
   const countries = {};
   analytics?.forEach(a => { if (a.country && a.country !== "unknown") countries[a.country] = (countries[a.country] || 0) + 1; });
   const topCountries = Object.entries(countries).sort((a, b) => b[1] - a[1]).slice(0, 5);
+
+  const topVideos = [...(videos || [])]
+    .sort((a, b) => (b.likes_count || 0) - (a.likes_count || 0))
+    .slice(0, 5)
+    .map(v => ({ id: v.id, community: v.community, caption: v.caption, likes_count: v.likes_count || 0 }));
+
+  const days = last7DayKeys();
+  const viewsByDay = Object.fromEntries(days.map(d => [d, 0]));
+  analytics?.forEach(a => { const k = dayKey(a.created_at); if (k in viewsByDay) viewsByDay[k]++; });
+  const videosByDay = Object.fromEntries(days.map(d => [d, 0]));
+  videos?.forEach(v => { const k = dayKey(v.created_at); if (k in videosByDay) videosByDay[k]++; });
+
+  const adAttempts = analytics?.filter(a => a.event === "vast_attempt").length || 0;
+  const adFilled = analytics?.filter(a => a.event === "vast_filled").length || 0;
+  const adErrors = analytics?.filter(a => a.event === "vast_error").length || 0;
+  const adEmpty = analytics?.filter(a => a.event === "vast_empty").length || 0;
+  const popunderFires = analytics?.filter(a => a.event === "popunder_fired").length || 0;
+
   res.json({
     app_users: uniqueUsers,
     total_videos: videos?.length || 0,
@@ -261,6 +334,17 @@ app.get("/admin/stats", adminAuth, async (req, res) => {
     web_views: webViews,
     mobile_views: mobileViews,
     top_countries: topCountries,
+    top_videos: topVideos,
+    views_last_7_days: viewsByDay,
+    videos_last_7_days: videosByDay,
+    ad_funnel: {
+      attempts: adAttempts,
+      filled: adFilled,
+      errors: adErrors,
+      empty: adEmpty,
+      fill_rate: adAttempts > 0 ? Math.round((adFilled / adAttempts) * 100) : 0,
+      popunder_fires: popunderFires,
+    },
   });
 });
 
@@ -330,7 +414,7 @@ app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🔐 Admin token: ${ADMIN_SECRET}`);
   await registerWebhook();
-  setTimeout(cleanupDeadVideos, 2 * 60 * 1000);
-  setInterval(cleanupDeadVideos, 60 * 60 * 1000);
+  setTimeout(migrateLegacyVideos, 2 * 60 * 1000);
+  setInterval(migrateLegacyVideos, 60 * 60 * 1000);
   scheduleDailyReminder();
 });
