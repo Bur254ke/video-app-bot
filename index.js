@@ -8,6 +8,7 @@ const { uploadFile, isPermanentUrl } = require("./storage");
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // Gumroad's Ping webhook posts form-encoded, not JSON
 app.use(cors({
   origin: ["https://foxyalexx.xyz", "https://www.foxyalexx.xyz", "https://video-app-web-one.vercel.app", "http://localhost:3000"],
   methods: ["GET", "POST", "DELETE"],
@@ -220,6 +221,53 @@ app.post("/webhook", async (req, res) => {
       { community, label: communityLabels[community], emoji: community === "haul" ? "🌸" : "🔥" }
     );
   }
+});
+
+// Gumroad's "Ping" notification — form-encoded POST, no signature to verify (Gumroad's
+// basic Ping feature doesn't support HMAC signing like Stripe does). Handles both new
+// sales and refund/dispute notifications for the same sale_id.
+app.post("/webhook/gumroad", async (req, res) => {
+  res.sendStatus(200); // ack immediately, same pattern as the Telegram webhook
+  const body = req.body || {};
+  const sale_id = body.sale_id;
+  const email = body.email;
+  if (!sale_id || !email) {
+    console.log("⚠️ Gumroad ping missing sale_id/email:", JSON.stringify(body).slice(0, 200));
+    return;
+  }
+
+  const isRefundEvent = body.refunded === "true" || body.refunded === true || body.resource_name === "refund";
+
+  if (isRefundEvent) {
+    await supabase.from("gumroad_purchases").update({ refunded: true }).eq("sale_id", sale_id);
+    console.log(`↩️ Gumroad refund recorded for sale ${sale_id}`);
+    return;
+  }
+
+  const { error } = await supabase.from("gumroad_purchases").upsert({
+    sale_id,
+    email: String(email).toLowerCase(),
+    product_permalink: body.product_permalink || null,
+    refunded: false,
+  }, { onConflict: "sale_id" });
+
+  if (error) console.error("❌ Gumroad purchase save error:", error.message);
+  else console.log(`💰 Gumroad purchase recorded: ${email}`);
+});
+
+app.post("/api/verify-purchase", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Missing email" });
+
+  const { data, error } = await supabase
+    .from("gumroad_purchases")
+    .select("id")
+    .eq("email", String(email).toLowerCase())
+    .eq("refunded", false)
+    .limit(1);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ verified: (data?.length || 0) > 0 });
 });
 
 app.get("/", (req, res) => res.json({ status: "ok", message: "Foxy Alexx bot running 🚀" }));
