@@ -37,6 +37,21 @@ async function trackEvent(event, platform, community, country) {
   } catch (e) {}
 }
 
+// Supabase caps each select at 1000 rows, which silently truncated /admin/stats
+// (views, countries and the whole ad funnel read as 0 once the table grew).
+// Page through the table instead.
+async function fetchAllRows(table, columns) {
+  const pageSize = 1000;
+  const rows = [];
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await supabase.from(table).select(columns).range(from, from + pageSize - 1);
+    if (error || !data || data.length === 0) break;
+    rows.push(...data);
+    if (data.length < pageSize) break;
+  }
+  return rows;
+}
+
 async function registerWebhook() {
   const webhookUrl = `${process.env.WEBHOOK_URL}/webhook`;
   const res = await fetch(`${TELEGRAM_API}/setWebhook?url=${webhookUrl}`);
@@ -363,10 +378,10 @@ function last7DayKeys() {
 }
 
 app.get("/admin/stats", adminAuth, async (req, res) => {
-  const { data: videos } = await supabase.from("videos").select("id, community, caption, likes_count, created_at");
-  const { data: users } = await supabase.from("users").select("id");
-  const { data: analytics } = await supabase.from("analytics").select("*");
-  const { data: appOpens } = await supabase.from("analytics").select("country").eq("event", "app_open");
+  const videos = await fetchAllRows("videos", "id, community, caption, likes_count, created_at");
+  const users = await fetchAllRows("users", "id");
+  const analytics = await fetchAllRows("analytics", "*");
+  const appOpens = analytics.filter(a => a.event === "app_open");
   const uniqueUsers = new Set(appOpens?.map(a => a.country)).size;
   const communityCount = {};
   videos?.forEach((v) => { communityCount[v.community] = (communityCount[v.community] || 0) + 1; });
@@ -394,7 +409,8 @@ app.get("/admin/stats", adminAuth, async (req, res) => {
   const adFilled = analytics?.filter(a => a.event === "vast_filled").length || 0;
   const adErrors = analytics?.filter(a => a.event === "vast_error").length || 0;
   const adEmpty = analytics?.filter(a => a.event === "vast_empty").length || 0;
-  const popunderFires = analytics?.filter(a => a.event === "popunder_fired").length || 0;
+  // The web app sent "lock_popunder" for a while; count both names.
+  const popunderFires = analytics?.filter(a => a.event === "popunder_fired" || a.event === "lock_popunder").length || 0;
 
   res.json({
     app_users: uniqueUsers,
