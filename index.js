@@ -4,6 +4,7 @@ const fetch = require("node-fetch");
 const cors = require("cors");
 const supabase = require("./supabase");
 const communities = require("./communities");
+const geoip = require("geoip-lite");
 const { uploadFile, isPermanentUrl } = require("./storage");
 
 const app = express();
@@ -35,6 +36,17 @@ async function trackEvent(event, platform, community, country) {
   try {
     await supabase.from("analytics").insert({ event, platform, community, country });
   } catch (e) {}
+}
+
+// Resolve the client's country. CDN headers only exist behind Cloudflare —
+// traffic reaches Railway directly, so fall back to a geoip-lite lookup on
+// the client IP (first hop of x-forwarded-for, set by Railway's proxy).
+function getCountry(req) {
+  const hdr = req.headers["cf-ipcountry"] || req.headers["x-vercel-ip-country"] || req.headers["x-country"];
+  if (hdr && hdr !== "XX" && hdr !== "unknown") return hdr;
+  const ip = (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket?.remoteAddress || "";
+  const geo = ip ? geoip.lookup(ip) : null;
+  return geo?.country || "unknown";
 }
 
 // Supabase caps each select at 1000 rows, which silently truncated /admin/stats
@@ -288,7 +300,7 @@ app.post("/api/verify-purchase", async (req, res) => {
 app.get("/", (req, res) => res.json({ status: "ok", message: "Foxy Alexx bot running 🚀" }));
 
 app.get("/api/videos/:community", async (req, res) => {
-  const country = req.headers["cf-ipcountry"] || req.headers["x-country"] || "unknown";
+  const country = getCountry(req);
   trackEvent("page_view", "web", req.params.community, country);
   const { data, error } = await supabase
     .from("videos")
@@ -300,7 +312,7 @@ app.get("/api/videos/:community", async (req, res) => {
 });
 
 app.get("/api/videos", async (req, res) => {
-  const country = req.headers["cf-ipcountry"] || "unknown";
+  const country = getCountry(req);
   trackEvent("app_open", "mobile", "all", country);
   const { data, error } = await supabase
     .from("videos")
@@ -332,7 +344,9 @@ app.post("/api/push-token", async (req, res) => {
 
 app.post("/api/track", async (req, res) => {
   const { event, platform, community, country } = req.body;
-  await trackEvent(event || "unknown", platform || "unknown", community || "unknown", country || "unknown");
+  // The web app hardcodes country:"unknown" — resolve it server-side instead.
+  const resolved = country && country !== "unknown" ? country : getCountry(req);
+  await trackEvent(event || "unknown", platform || "unknown", community || "unknown", resolved);
   res.json({ success: true });
 });
 
