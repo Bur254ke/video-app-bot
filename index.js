@@ -391,6 +391,69 @@ function last7DayKeys() {
   return days;
 }
 
+// ─── TEMPORARY: server-side R2 migration (remove after the cutover) ──────────
+// Copies every Supabase-hosted video/thumbnail to R2 and rewrites the row,
+// using Railway's datacenter bandwidth instead of a home connection.
+// POST starts it (idempotent — skips rows already on R2); GET reports progress.
+const SB_STORAGE_MARKER = "/storage/v1/object/public/videos/";
+let r2Migration = { running: false, total: 0, done: 0, failed: 0, errors: [] };
+
+async function migrateRowToR2(row) {
+  const { uploadFile } = require("./storage");
+  const patch = {};
+  for (const col of ["video_url", "thumbnail_url"]) {
+    const u = row[col];
+    if (!u || !u.includes(SB_STORAGE_MARKER)) continue;
+    const key = decodeURIComponent(u.split(SB_STORAGE_MARKER)[1]);
+    const resp = await fetch(u);
+    if (!resp.ok) throw new Error(`download ${resp.status}`);
+    const buf = await resp.buffer();
+    const ct = /\.(jpe?g)$/i.test(key) ? "image/jpeg" : /\.webm$/i.test(key) ? "video/webm" : "video/mp4";
+    const newUrl = await uploadFile(key, buf, ct);
+    const check = await fetch(newUrl, { method: "HEAD" });
+    if (!check.ok || Number(check.headers.get("content-length")) !== buf.length)
+      throw new Error(`CDN verify failed for ${key}`);
+    patch[col] = newUrl;
+  }
+  if (Object.keys(patch).length) {
+    const { error } = await supabase.from("videos").update(patch).eq("id", row.id);
+    if (error) throw new Error(`DB update: ${error.message}`);
+  }
+}
+
+app.post("/admin/migrate-r2", adminAuth, async (req, res) => {
+  if (!process.env.R2_BUCKET) return res.status(400).json({ error: "R2 env vars not set" });
+  if (r2Migration.running) return res.json({ already_running: true, ...r2Migration });
+
+  const { data: rows, error } = await supabase
+    .from("videos").select("id, video_url, thumbnail_url")
+    .or(`video_url.like.%${SB_STORAGE_MARKER}%,thumbnail_url.like.%${SB_STORAGE_MARKER}%`)
+    .limit(2000);
+  if (error) return res.status(500).json({ error: error.message });
+
+  r2Migration = { running: true, total: rows.length, done: 0, failed: 0, errors: [] };
+  res.json({ started: true, total: rows.length });
+
+  const CONCURRENCY = 4;
+  let idx = 0;
+  await Promise.all(Array.from({ length: CONCURRENCY }, async () => {
+    while (idx < rows.length) {
+      const row = rows[idx++];
+      try {
+        await migrateRowToR2(row);
+        r2Migration.done++;
+      } catch (e) {
+        r2Migration.failed++;
+        if (r2Migration.errors.length < 20) r2Migration.errors.push(`${row.id}: ${e.message}`);
+      }
+    }
+  }));
+  r2Migration.running = false;
+  console.log(`🚚 R2 migration finished: ${r2Migration.done} ok, ${r2Migration.failed} failed`);
+});
+
+app.get("/admin/migrate-r2", adminAuth, (req, res) => res.json(r2Migration));
+
 app.get("/admin/stats", adminAuth, async (req, res) => {
   const videos = await fetchAllRows("videos", "id, community, caption, likes_count, created_at");
   const users = await fetchAllRows("users", "id");
