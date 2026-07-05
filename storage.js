@@ -33,4 +33,21 @@ function isPermanentUrl(url) {
   return !!url && url.includes(`/storage/v1/object/public/${BUCKET}/`);
 }
 
-module.exports = { uploadFile, isPermanentUrl, BUCKET };
+function pathFromPublicUrl(url) {
+  const marker = `/storage/v1/object/public/${BUCKET}/`;
+  if (!url || !url.includes(marker)) return null;
+  return decodeURIComponent(url.split(marker)[1]);
+}
+
+// Remove the storage objects behind a list of public URLs. Non-URL or
+// external entries are ignored; errors are logged, not thrown, so a failed
+// storage cleanup never blocks the DB deletion that triggered it.
+async function deleteFiles(urls) {
+  const paths = (urls || []).map(pathFromPublicUrl).filter(Boolean);
+  if (!paths.length) return;
+  const { error } = await supabase.storage.from(BUCKET).remove(paths);
+  if (error) console.error("❌ Storage delete error:", error.message);
+  else console.log(`🗑️ Deleted ${paths.length} storage file(s)`);
+}
+
+module.exports = { uploadFile, isPermanentUrl, deleteFiles, BUCKET };

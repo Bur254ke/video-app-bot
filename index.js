@@ -5,7 +5,7 @@ const cors = require("cors");
 const supabase = require("./supabase");
 const communities = require("./communities");
 const geoip = require("geoip-lite");
-const { uploadFile, isPermanentUrl } = require("./storage");
+const { uploadFile, isPermanentUrl, deleteFiles } = require("./storage");
 
 const app = express();
 app.use(express.json());
@@ -481,14 +481,20 @@ app.get("/admin/communities", adminAuth, async (req, res) => {
 });
 
 app.delete("/admin/videos/:id", adminAuth, async (req, res) => {
+  // Grab the file URLs first: deleting only the row used to leave the video
+  // and thumbnail behind in storage forever (3.3 GB of orphans by Jul 2026).
+  const { data: vid } = await supabase.from("videos").select("video_url, thumbnail_url").eq("id", req.params.id).single();
   const { error } = await supabase.from("videos").delete().eq("id", req.params.id);
   if (error) return res.status(500).json({ error: error.message });
+  if (vid) deleteFiles([vid.video_url, vid.thumbnail_url]);
   res.json({ success: true, deleted_id: req.params.id });
 });
 
 app.delete("/admin/communities/:community", adminAuth, async (req, res) => {
+  const { data: vids } = await supabase.from("videos").select("video_url, thumbnail_url").eq("community", req.params.community);
   const { error } = await supabase.from("videos").delete().eq("community", req.params.community);
   if (error) return res.status(500).json({ error: error.message });
+  if (vids?.length) deleteFiles(vids.flatMap((v) => [v.video_url, v.thumbnail_url]));
   res.json({ success: true, deleted_community: req.params.community });
 });
 
