@@ -11,7 +11,7 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true })); // Gumroad's Ping webhook posts form-encoded, not JSON
 app.use(cors({
-  origin: ["https://foxyalexx.xyz", "https://www.foxyalexx.xyz", "https://video-app-web-one.vercel.app", "http://localhost:3000"],
+  origin: ["https://foxyalexx.xyz", "https://www.foxyalexx.xyz", "https://maitwerking.xyz", "https://www.maitwerking.xyz", "https://video-app-web-one.vercel.app", "http://localhost:3000"],
   methods: ["GET", "POST", "DELETE"],
 }));
 
