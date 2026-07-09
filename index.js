@@ -313,7 +313,19 @@ app.get("/api/videos/:community", async (req, res) => {
 
 app.get("/api/videos", async (req, res) => {
   const country = getCountry(req);
-  trackEvent("app_open", "mobile", "all", country);
+  // Only real app launches count as app_open — the sites' home pages fetch
+  // this same endpoint for their preview cards, and those browser fetches
+  // always carry an Origin/Referer (cross-origin), while the app's native
+  // fetch carries neither. The app (v1.1.1+) also sends x-device-id
+  // (androidId); it's stored in the community column — the analytics table
+  // has no device column and app_open rows never used community anyway —
+  // so /admin/stats can count distinct real devices.
+  const fromBrowser = !!(req.headers.origin || req.headers.referer);
+  if (fromBrowser) {
+    trackEvent("home_view", "web", "all", country);
+  } else {
+    trackEvent("app_open", "mobile", req.headers["x-device-id"] || "all", country);
+  }
   const { data, error } = await supabase
     .from("videos")
     .select("*")
@@ -459,7 +471,13 @@ app.get("/admin/stats", adminAuth, async (req, res) => {
   const users = await fetchAllRows("users", "id");
   const analytics = await fetchAllRows("analytics", "*");
   const appOpens = analytics.filter(a => a.event === "app_open");
-  const uniqueUsers = new Set(appOpens?.map(a => a.country)).size;
+  // Real unique devices: app_open rows carry the device's androidId in the
+  // community column (v1.1.1+). Legacy rows ("all") predate device ids and
+  // web-home pollution, so they can't be de-duplicated — reported separately
+  // as app_opens_total.
+  const uniqueUsers = new Set(
+    appOpens.map(a => a.community).filter(c => c && c !== "all")
+  ).size;
   const communityCount = {};
   videos?.forEach((v) => { communityCount[v.community] = (communityCount[v.community] || 0) + 1; });
   const mostActive = Object.entries(communityCount).sort((a, b) => b[1] - a[1])[0];
@@ -491,6 +509,7 @@ app.get("/admin/stats", adminAuth, async (req, res) => {
 
   res.json({
     app_users: uniqueUsers,
+    app_opens_total: appOpens.length,
     total_videos: videos?.length || 0,
     total_users: users?.length || 0,
     videos_by_community: communityCount,
