@@ -466,6 +466,59 @@ app.post("/admin/migrate-r2", adminAuth, async (req, res) => {
 
 app.get("/admin/migrate-r2", adminAuth, (req, res) => res.json(r2Migration));
 
+// Which site a community (or analytics row) belongs to. Foxy Alexx and Mai
+// Twerking share this backend/DB but must never be mixed in reporting.
+// Legacy/site-wide rows ("site", "all", device ids from app_open) belong to
+// foxyalexx — the app and its tracking are Foxy Alexx's.
+const MAI_COMMUNITIES = new Set(["maitwerking", "maitrending", "wetlooks"]);
+function siteOf(community) {
+  return MAI_COMMUNITIES.has(community) ? "maitwerking" : "foxyalexx";
+}
+
+// Full stats block for one site's videos + analytics rows.
+function summarizeSite(videos, analytics) {
+  const communityCount = {};
+  videos.forEach((v) => { communityCount[v.community] = (communityCount[v.community] || 0) + 1; });
+  const mostActive = Object.entries(communityCount).sort((a, b) => b[1] - a[1])[0];
+  const countries = {};
+  analytics.forEach(a => { if (a.country && a.country !== "unknown") countries[a.country] = (countries[a.country] || 0) + 1; });
+
+  const days = last7DayKeys();
+  const viewsByDay = Object.fromEntries(days.map(d => [d, 0]));
+  analytics.forEach(a => { const k = dayKey(a.created_at); if (k in viewsByDay) viewsByDay[k]++; });
+  const videosByDay = Object.fromEntries(days.map(d => [d, 0]));
+  videos.forEach(v => { const k = dayKey(v.created_at); if (k in videosByDay) videosByDay[k]++; });
+
+  const adAttempts = analytics.filter(a => a.event === "vast_attempt").length;
+  const adFilled = analytics.filter(a => a.event === "vast_filled").length;
+
+  return {
+    total_videos: videos.length,
+    videos_by_community: communityCount,
+    most_active_community: mostActive ? mostActive[0] : "none",
+    total_views: analytics.length,
+    views_today: analytics.filter(a => new Date(a.created_at) > new Date(Date.now() - 86400000)).length,
+    web_views: analytics.filter(a => a.platform === "web").length,
+    mobile_views: analytics.filter(a => a.platform === "mobile").length,
+    top_countries: Object.entries(countries).sort((a, b) => b[1] - a[1]).slice(0, 5),
+    top_videos: [...videos]
+      .sort((a, b) => (b.likes_count || 0) - (a.likes_count || 0))
+      .slice(0, 5)
+      .map(v => ({ id: v.id, community: v.community, caption: v.caption, likes_count: v.likes_count || 0 })),
+    views_last_7_days: viewsByDay,
+    videos_last_7_days: videosByDay,
+    ad_funnel: {
+      attempts: adAttempts,
+      filled: adFilled,
+      errors: analytics.filter(a => a.event === "vast_error").length,
+      empty: analytics.filter(a => a.event === "vast_empty").length,
+      fill_rate: adAttempts > 0 ? Math.round((adFilled / adAttempts) * 100) : 0,
+      // The web app sent "lock_popunder" for a while; count both names.
+      popunder_fires: analytics.filter(a => a.event === "popunder_fired" || a.event === "lock_popunder").length,
+    },
+  };
+}
+
 app.get("/admin/stats", adminAuth, async (req, res) => {
   const videos = await fetchAllRows("videos", "id, community, caption, likes_count, created_at");
   const users = await fetchAllRows("users", "id");
@@ -478,58 +531,28 @@ app.get("/admin/stats", adminAuth, async (req, res) => {
   const uniqueUsers = new Set(
     appOpens.map(a => a.community).filter(c => c && c !== "all")
   ).size;
-  const communityCount = {};
-  videos?.forEach((v) => { communityCount[v.community] = (communityCount[v.community] || 0) + 1; });
-  const mostActive = Object.entries(communityCount).sort((a, b) => b[1] - a[1])[0];
-  const totalViews = analytics?.length || 0;
-  const todayViews = analytics?.filter(a => new Date(a.created_at) > new Date(Date.now() - 86400000)).length || 0;
-  const webViews = analytics?.filter(a => a.platform === "web").length || 0;
-  const mobileViews = analytics?.filter(a => a.platform === "mobile").length || 0;
-  const countries = {};
-  analytics?.forEach(a => { if (a.country && a.country !== "unknown") countries[a.country] = (countries[a.country] || 0) + 1; });
-  const topCountries = Object.entries(countries).sort((a, b) => b[1] - a[1]).slice(0, 5);
 
-  const topVideos = [...(videos || [])]
-    .sort((a, b) => (b.likes_count || 0) - (a.likes_count || 0))
-    .slice(0, 5)
-    .map(v => ({ id: v.id, community: v.community, caption: v.caption, likes_count: v.likes_count || 0 }));
+  // Per-site split — Foxy Alexx and Mai Twerking are reported separately so
+  // each site's performance is followable on its own.
+  const sites = {};
+  for (const site of ["foxyalexx", "maitwerking"]) {
+    sites[site] = summarizeSite(
+      (videos || []).filter(v => siteOf(v.community) === site),
+      (analytics || []).filter(a => siteOf(a.community) === site)
+    );
+  }
+  // The app (and its device-id app_open rows) is Foxy Alexx's.
+  sites.foxyalexx.app_users = uniqueUsers;
+  sites.foxyalexx.app_opens_total = appOpens.length;
 
-  const days = last7DayKeys();
-  const viewsByDay = Object.fromEntries(days.map(d => [d, 0]));
-  analytics?.forEach(a => { const k = dayKey(a.created_at); if (k in viewsByDay) viewsByDay[k]++; });
-  const videosByDay = Object.fromEntries(days.map(d => [d, 0]));
-  videos?.forEach(v => { const k = dayKey(v.created_at); if (k in videosByDay) videosByDay[k]++; });
-
-  const adAttempts = analytics?.filter(a => a.event === "vast_attempt").length || 0;
-  const adFilled = analytics?.filter(a => a.event === "vast_filled").length || 0;
-  const adErrors = analytics?.filter(a => a.event === "vast_error").length || 0;
-  const adEmpty = analytics?.filter(a => a.event === "vast_empty").length || 0;
-  // The web app sent "lock_popunder" for a while; count both names.
-  const popunderFires = analytics?.filter(a => a.event === "popunder_fired" || a.event === "lock_popunder").length || 0;
-
+  // Network-wide legacy fields kept so older admin clients don't break.
+  const combined = summarizeSite(videos || [], analytics || []);
   res.json({
+    sites,
     app_users: uniqueUsers,
     app_opens_total: appOpens.length,
-    total_videos: videos?.length || 0,
     total_users: users?.length || 0,
-    videos_by_community: communityCount,
-    most_active_community: mostActive ? mostActive[0] : "none",
-    total_views: totalViews,
-    views_today: todayViews,
-    web_views: webViews,
-    mobile_views: mobileViews,
-    top_countries: topCountries,
-    top_videos: topVideos,
-    views_last_7_days: viewsByDay,
-    videos_last_7_days: videosByDay,
-    ad_funnel: {
-      attempts: adAttempts,
-      filled: adFilled,
-      errors: adErrors,
-      empty: adEmpty,
-      fill_rate: adAttempts > 0 ? Math.round((adFilled / adAttempts) * 100) : 0,
-      popunder_fires: popunderFires,
-    },
+    ...combined,
   });
 });
 
