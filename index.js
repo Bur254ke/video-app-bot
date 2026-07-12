@@ -556,6 +556,80 @@ app.get("/admin/stats", adminAuth, async (req, res) => {
   });
 });
 
+// ─── ExoClick publisher stats ────────────────────────────────────────────────
+// Proxies the ExoClick API so the admin app never sees the API token. The
+// token (EXOCLICK_API_TOKEN) is exchanged for a 12h Bearer JWT, cached in
+// memory and refreshed on expiry. Returns totals + zone + country + daily
+// breakdowns for a date range (defaults: this month).
+let exoJwt = { token: null, exp: 0 };
+async function exoLogin() {
+  if (exoJwt.token && Date.now() < exoJwt.exp) return exoJwt.token;
+  const apiToken = process.env.EXOCLICK_API_TOKEN;
+  if (!apiToken) throw new Error("EXOCLICK_API_TOKEN not set");
+  const r = await fetch("https://api.exoclick.com/v2/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ api_token: apiToken }),
+  });
+  if (!r.ok) throw new Error(`ExoClick login ${r.status}`);
+  const d = await r.json();
+  // Refresh a minute before the real expiry to avoid a race.
+  exoJwt = { token: d.token, exp: Date.now() + (d.expires_in - 60) * 1000 };
+  return exoJwt.token;
+}
+async function exoStats(path, from, to) {
+  const jwt = await exoLogin();
+  const url = `https://api.exoclick.com/v2/statistics/publisher/${path}?date-from=${from}&date-to=${to}`;
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${jwt}` } });
+  if (!r.ok) throw new Error(`ExoClick ${path} ${r.status}`);
+  return (await r.json()).result || [];
+}
+function exoSum(rows) {
+  return rows.reduce(
+    (a, x) => ({
+      impressions: a.impressions + (x.impressions || 0),
+      clicks: a.clicks + (x.clicks || 0),
+      revenue: a.revenue + (x.revenue || 0),
+    }),
+    { impressions: 0, clicks: 0, revenue: 0 }
+  );
+}
+app.get("/admin/exoclick-stats", adminAuth, async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const monthStart = today.slice(0, 8) + "01";
+    const from = req.query.from || monthStart;
+    const to = req.query.to || today;
+    const [daily, zones, countries, todayRows] = await Promise.all([
+      exoStats("date", from, to),
+      exoStats("zone", from, to),
+      exoStats("country", from, to),
+      exoStats("date", today, today),
+    ]);
+    const round = (n) => Math.round(n * 1e4) / 1e4;
+    const shape = (rows, key) =>
+      rows
+        .map((r) => ({
+          [key]: r[key === "date" ? "ddate" : key],
+          impressions: r.impressions || 0,
+          clicks: r.clicks || 0,
+          revenue: round(r.revenue || 0),
+          cpm: round(r.cpm || 0),
+        }))
+        .sort((a, b) => b.revenue - a.revenue);
+    res.json({
+      range: { from, to },
+      today: exoSum(todayRows),
+      month: exoSum(daily),
+      by_date: shape(daily, "date").sort((a, b) => (a.date < b.date ? -1 : 1)),
+      by_zone: shape(zones, "idzone").slice(0, 25),
+      by_country: shape(countries, "country").slice(0, 25),
+    });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
 app.get("/admin/settings", adminAuth, async (req, res) => {
   const { data, error } = await supabase.from("settings").select("*");
   if (error) return res.status(500).json({ error: error.message });
