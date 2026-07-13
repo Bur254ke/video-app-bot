@@ -7,6 +7,36 @@ const communities = require("./communities");
 const geoip = require("geoip-lite");
 const { uploadFile, isPermanentUrl, deleteFiles } = require("./storage");
 
+// ─── Web Push (PWA new-video notifications) ──────────────────────────────────
+const webpush = require("web-push");
+const VAPID_PUBLIC = process.env.VAPID_PUBLIC;
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE;
+if (VAPID_PUBLIC && VAPID_PRIVATE) {
+  webpush.setVapidDetails("mailto:admin@foxyalexx.xyz", VAPID_PUBLIC, VAPID_PRIVATE);
+}
+// Send a web push to every subscribed browser for a site. Dead subscriptions
+// (410/404) are pruned so the list stays clean.
+async function sendWebPushToAll(site, title, body, url) {
+  if (!VAPID_PUBLIC || !VAPID_PRIVATE) return;
+  try {
+    const { data: subs } = await supabase
+      .from("web_push_subs")
+      .select("endpoint, subscription")
+      .eq("site", site);
+    if (!subs || !subs.length) return;
+    const payload = JSON.stringify({ title, body, url, tag: site + "-new" });
+    await Promise.all(
+      subs.map((s) =>
+        webpush.sendNotification(s.subscription, payload).catch((err) => {
+          if (err.statusCode === 410 || err.statusCode === 404) {
+            supabase.from("web_push_subs").delete().eq("endpoint", s.endpoint).then(() => {});
+          }
+        })
+      )
+    );
+  } catch (e) {}
+}
+
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true })); // Gumroad's Ping webhook posts form-encoded, not JSON
@@ -354,6 +384,22 @@ app.post("/api/push-token", async (req, res) => {
   }
 });
 
+// Store a browser's web-push subscription (PWA). Keyed on endpoint so the same
+// browser re-subscribing just updates its row.
+app.post("/api/push/subscribe", async (req, res) => {
+  const { subscription, site } = req.body || {};
+  if (!subscription || !subscription.endpoint) return res.status(400).json({ error: "Missing subscription" });
+  try {
+    await supabase.from("web_push_subs").upsert(
+      { endpoint: subscription.endpoint, subscription, site: site || "foxyalexx" },
+      { onConflict: "endpoint" }
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/api/track", async (req, res) => {
   const { event, platform, community, country } = req.body;
   // The web app hardcodes country:"unknown" — resolve it server-side instead.
@@ -695,6 +741,10 @@ app.post("/admin/notify", adminAuth, async (req, res) => {
     `Fresh content just dropped in ${resolvedLabel}`,
     { community, label: resolvedLabel, emoji: community === "haul" ? "🌸" : "🔥" }
   );
+  // Web push (PWA) — route to the right site by community.
+  const site = siteOf(community);
+  const siteName = site === "maitwerking" ? "Twerking Mai 🍑" : "Foxy Alexx 🦊";
+  sendWebPushToAll(site, `New video on ${siteName}`, `Fresh content in ${resolvedLabel} — tap to watch`, `/community/${community}`);
   res.json({ success: true });
 });
 
