@@ -189,18 +189,17 @@ async function migrateLegacyVideos() {
   if (legacy.length === 0) return;
 
   console.log(`🔄 Migrating ${legacy.length} legacy video(s) to permanent storage...`);
-  let migrated = 0, deleted = 0, skipped = 0;
+  let migrated = 0, skipped = 0;
   for (const video of legacy) {
     const file = await downloadTelegramFile(video.file_id);
     if (!file.buffer) {
-      if (file.gone) {
-        await supabase.from("videos").delete().eq("id", video.id);
-        deleted++;
-        console.log(`🗑️ Confirmed gone from Telegram, removed: ${video.id} (${file.reason})`);
-      } else {
-        skipped++;
-        console.log(`⏭️ Skipping ${video.id} for now — not deleting (${file.reason})`);
-      }
+      // 2026-07-16: NEVER auto-delete rows. Previously a Telegram-confirmed
+      // "file gone" pruned the row — but source channels deleting old posts
+      // (and past outages) wiped real content. The user prefers keeping a
+      // stale row (worst case a non-playing legacy video) over ever losing
+      // one. Just skip and retry next cycle; remove only via the admin route.
+      skipped++;
+      console.log(`⏭️ Skipping ${video.id} — not deleting (${file.reason})`);
       continue;
     }
     try {
@@ -211,7 +210,7 @@ async function migrateLegacyVideos() {
       console.error(`❌ Migration upload failed for ${video.id}:`, e.message);
     }
   }
-  console.log(`✅ Migration done — migrated ${migrated}, removed ${deleted} confirmed-gone, skipped ${skipped}`);
+  console.log(`✅ Migration done — migrated ${migrated}, skipped ${skipped} (auto-delete disabled)`);
 }
 
 async function sendPushToAll(title, body, data = {}) {
@@ -271,12 +270,28 @@ app.post("/webhook", async (req, res) => {
     console.error("❌ Supabase error:", error.message);
   } else {
     console.log(`✅ Saved → community: ${community}`);
-    const communityLabels = { haul: "Femboys", haul2: "Trending" };
-    sendPushToAll(
-      "🦊 New video on Foxy Alexx!",
-      `Fresh content just dropped in ${communityLabels[community] || community}`,
-      { community, label: communityLabels[community], emoji: community === "haul" ? "🌸" : "🔥" }
-    );
+    // Route the "new video" push to the right SITE (a community may now belong
+    // to twerking-mai after the 2026-07-16 rewire — don't blast a Foxy-branded
+    // app push for maitwerking/maitrending content).
+    const communityLabels = {
+      haul: "Femboys", haul2: "Trending", trans: "Trans",
+      maitwerking: "Mai Twerking", maitrending: "Trending", wetlooks: "WET💦LOOKS",
+    };
+    const label = communityLabels[community] || community;
+    if (siteOf(community) === "maitwerking") {
+      sendWebPushToAll(
+        "maitwerking",
+        "New video on Twerking Mai 🍑",
+        `Fresh content in ${label} — tap to watch`,
+        `/community/${community}`
+      );
+    } else {
+      sendPushToAll(
+        "🦊 New video on Foxy Alexx!",
+        `Fresh content just dropped in ${label}`,
+        { community, label, emoji: community === "haul" ? "🌸" : "🔥" }
+      );
+    }
   }
 });
 
