@@ -617,6 +617,35 @@ app.get("/admin/stats", adminAuth, async (req, res) => {
   });
 });
 
+// ─── NeverBlock anti-adblock proxy ────────────────────────────────────────
+// Fetches ExoClick banner ads server-side so ad blockers can't intercept.
+// Frontend calls /api/neverblock?zones=5955418,5957132 and gets back
+// the ad data to render directly — ad blocker sees your domain, not ExoClick.
+app.get("/api/neverblock", async (req, res) => {
+  try {
+    const zones = (req.query.zones || "").split(",").filter(Boolean);
+    if (!zones.length) return res.status(400).json({ error: "no zones" });
+    const userIp = req.headers["x-forwarded-for"]?.split(",")[0]?.trim()
+      || req.headers["x-real-ip"]
+      || req.socket.remoteAddress
+      || "1.1.1.1";
+    const params = zones.map((z, i) => `zones[${i}][idzone]=${z.trim()}`).join("&");
+    const url = `https://syndication-adblock.exoclick.com/ads-multi.php?${params}&user_ip=${userIp}`;
+    const r = await fetch(url, {
+      headers: {
+        "X-Forwarded-For": userIp,
+        "Referer": "https://foxyalexx.xyz",
+        "User-Agent": req.headers["user-agent"] || "Mozilla/5.0",
+        "Accept-Language": req.headers["accept-language"] || "en-US,en;q=0.9",
+      },
+    });
+    const data = await r.json();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── ExoClick publisher stats ────────────────────────────────────────────────
 // Proxies the ExoClick API so the admin app never sees the API token. The
 // token (EXOCLICK_API_TOKEN) is exchanged for a 12h Bearer JWT, cached in
