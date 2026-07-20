@@ -356,6 +356,29 @@ app.get("/api/videos/:community", async (req, res) => {
   res.json({ videos: data });
 });
 
+function rotateVideos(videos) {
+  const day = new Date().getDay(); // 0=Sun,1=Mon,2=Tue,3=Wed,4=Thu,5=Fri,6=Sat
+  const len = videos.length;
+  if (len === 0) return videos;
+
+  if (day === 1 || day === 2) {
+    // Mon/Tue — reverse (oldest first)
+    return [...videos].reverse();
+  }
+  if (day === 3 || day === 4) {
+    // Wed/Thu — middle to back
+    const mid = Math.floor(len / 2);
+    return [...videos.slice(mid), ...videos.slice(0, mid)];
+  }
+  if (day === 5 || day === 6) {
+    // Fri/Sat — middle to front then back
+    const mid = Math.floor(len / 2);
+    return [...videos.slice(mid), ...videos.slice(0, mid)].reverse();
+  }
+  // Sun — normal
+  return videos;
+}
+
 app.get("/api/videos", async (req, res) => {
   const country = getCountry(req);
   // Only real app launches count as app_open — the sites' home pages fetch
@@ -377,7 +400,7 @@ app.get("/api/videos", async (req, res) => {
     .order("created_at", { ascending: false })
     .limit(50);
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ videos: data });
+  res.json({ videos: rotateVideos(data) });
 });
 
 app.get("/api/settings", async (req, res) => {
