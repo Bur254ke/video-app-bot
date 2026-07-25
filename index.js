@@ -550,6 +550,89 @@ app.post("/admin/migrate-r2", adminAuth, async (req, res) => {
 
 app.get("/admin/migrate-r2", adminAuth, (req, res) => res.json(r2Migration));
 
+// ─── Video transcode to 480p ────────────────────────────────────────────────
+// Source clips are 1080p ~3.3 Mbps masters (7+ MB for 18s) being served to a
+// phone-sized reel feed — the cause of the FluidPlayer playback timeouts.
+// Re-encodes to 480p (~1/7th the bytes) on Railway's bandwidth and CPU.
+//
+// Originals are preserved: the compressed file goes to a separate "c480/" key
+// and only the DB row is repointed, so a bad batch is undone by restoring
+// video_url. POST starts, GET reports progress. Idempotent — rows already
+// pointing at c480/ are skipped, so it is safe to re-run after a crash.
+//
+// Thumbnails are untouched (they are already small).
+let transcodeJob = { running: false, total: 0, done: 0, skipped: 0, failed: 0, savedBytes: 0, errors: [] };
+
+async function transcodeRow(row) {
+  const { uploadFile } = require("./storage");
+  const tc = require("./transcode");
+  const url = row.video_url;
+  if (!url || tc.isTranscoded(url)) { transcodeJob.skipped++; return; }
+
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`download ${resp.status}`);
+  const buf = await resp.buffer();
+
+  if (buf.length < tc.MIN_BYTES) { transcodeJob.skipped++; return; }
+
+  const out = await tc.encodeBuffer(buf);
+  // null = the encode came out no smaller than the source. Leave the row alone.
+  if (!out) { transcodeJob.skipped++; return; }
+
+  const key = tc.compressedKeyFor(url);
+  const newUrl = await uploadFile(key, out, "video/mp4");
+
+  // Verify the CDN really has it at the expected length before repointing the
+  // row — the same guard the R2 migration uses.
+  const check = await fetch(newUrl, { method: "HEAD" });
+  if (!check.ok || Number(check.headers.get("content-length")) !== out.length)
+    throw new Error(`CDN verify failed for ${key}`);
+
+  const { error } = await supabase.from("videos").update({ video_url: newUrl }).eq("id", row.id);
+  if (error) throw new Error(`DB update: ${error.message}`);
+
+  transcodeJob.savedBytes += buf.length - out.length;
+  transcodeJob.done++;
+}
+
+app.post("/admin/transcode", adminAuth, async (req, res) => {
+  if (transcodeJob.running) return res.json({ already_running: true, ...transcodeJob });
+
+  const limit = Math.min(Number(req.query.limit) || 500, 2000);
+  const { data: rows, error } = await supabase
+    .from("videos").select("id, video_url")
+    .not("video_url", "is", null)
+    .not("video_url", "like", `%/${require("./transcode").PREFIX}%`)
+    .limit(limit);
+  if (error) return res.status(500).json({ error: error.message });
+
+  transcodeJob = { running: true, total: rows.length, done: 0, skipped: 0, failed: 0, savedBytes: 0, errors: [] };
+  res.json({ started: true, total: rows.length });
+
+  // ffmpeg is CPU-bound and Railway containers are small — 2 at a time. Higher
+  // concurrency just thrashes and risks the container's memory limit.
+  const CONCURRENCY = 2;
+  let idx = 0;
+  await Promise.all(Array.from({ length: CONCURRENCY }, async () => {
+    while (idx < rows.length) {
+      const row = rows[idx++];
+      try {
+        await transcodeRow(row);
+      } catch (e) {
+        transcodeJob.failed++;
+        if (transcodeJob.errors.length < 20) transcodeJob.errors.push(`${row.id}: ${e.message}`);
+      }
+    }
+  }));
+  transcodeJob.running = false;
+  console.log(`🎬 transcode finished: ${transcodeJob.done} ok, ${transcodeJob.skipped} skipped, ${transcodeJob.failed} failed, ${(transcodeJob.savedBytes / 1e9).toFixed(2)} GB saved`);
+});
+
+app.get("/admin/transcode", adminAuth, (req, res) => res.json({
+  ...transcodeJob,
+  savedGB: +(transcodeJob.savedBytes / 1e9).toFixed(2),
+}));
+
 // Which site a community (or analytics row) belongs to. Foxy Alexx and Mai
 // Twerking share this backend/DB but must never be mixed in reporting.
 // Legacy/site-wide rows ("site", "all", device ids from app_open) belong to
