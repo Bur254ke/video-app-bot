@@ -344,14 +344,31 @@ app.post("/api/verify-purchase", async (req, res) => {
 
 app.get("/", (req, res) => res.json({ status: "ok", message: "Foxy Alexx bot running 🚀" }));
 
+// 2026-07-26: optional pagination. The web feed was shipping ~1089 rows in one
+// ~1.7s response and rendering all of them. limit/offset/order are ADDITIVE —
+// with no params the response is byte-for-byte what it always was, so the
+// Android app and any older web deploy keep working unchanged.
+//   ?limit=30&offset=0&order=asc
+// order=asc is what the web feed uses: oldest-first means new videos land at
+// the tail, so an index never shifts under a viewer mid-session.
 app.get("/api/videos/:community", async (req, res) => {
   const country = getCountry(req);
   trackEvent("page_view", "web", req.params.community, country);
-  const { data, error } = await supabase
+
+  const rawLimit = parseInt(req.query.limit, 10);
+  const rawOffset = parseInt(req.query.offset, 10);
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 100) : null;
+  const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? rawOffset : 0;
+  const ascending = req.query.order === "asc";
+
+  let q = supabase
     .from("videos")
     .select("*")
     .eq("community", req.params.community)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending });
+  if (limit !== null) q = q.range(offset, offset + limit - 1);
+
+  const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   res.json({ videos: data });
 });
