@@ -56,6 +56,35 @@ function adminAuth(req, res, next) {
   next();
 }
 
+// First-party outbound-click log (2026-07-26). The site had NO first-party
+// measurement of any kind — no analytics script, no click logging — while every
+// money link carried rel="noreferrer", so neither we nor the destination could
+// attribute a single one of ~2,000 outbound anchors.
+//
+// Registered BEFORE the x-app-secret gate on purpose: the client sends this with
+// navigator.sendBeacon, which cannot set custom headers. It is write-only, takes
+// no user data, and lands in the same analytics table as everything else.
+// Body arrives as text/plain (a simple request, so no CORS preflight — a beacon
+// can't wait for one), hence the explicit text parser.
+app.post("/api/click", express.text({ type: "*/*", limit: "4kb" }), async (req, res) => {
+  let p = {};
+  try { p = JSON.parse(req.body || "{}"); } catch (e) {}
+  const placement = String(p.placement || "unknown").slice(0, 60);
+  const destination = String(p.destination || "unknown").slice(0, 40);
+  const community = String(p.community || "unknown").slice(0, 40);
+  const idx = Number.isFinite(p.index) ? p.index : null;
+  // analytics is (event, platform, community, country) — encode the extra
+  // dimensions into event/community rather than migrating the table.
+  await trackEvent(
+    "click_" + placement + "__" + destination,
+    "web",
+    community + (idx === null ? "" : "|i" + idx),
+    getCountry(req)
+  );
+  // 204: nothing to read, and a beacon ignores the body anyway.
+  res.status(204).end();
+});
+
 app.use("/api", (req, res, next) => {
   const secret = req.headers["x-app-secret"];
   if (APP_SECRET && secret !== APP_SECRET) return res.status(403).json({ error: "Unauthorized" });
