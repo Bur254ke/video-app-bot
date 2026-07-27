@@ -749,9 +749,13 @@ app.get("/admin/stats", adminAuth, async (req, res) => {
   // each site's performance is followable on its own.
   const sites = {};
   for (const site of ["foxyalexx", "maitwerking"]) {
+    // baseCommunity() strips the "|i<feedIndex>" suffix that /api/click writes
+    // into the community column. Without it every indexed click row fell through
+    // to the foxyalexx default, so maitwerking's clicks were reported under
+    // foxyalexx from 2026-07-26 (when click logging landed) until 07-27.
     sites[site] = summarizeSite(
       (videos || []).filter(v => siteOf(v.community) === site),
-      (analytics || []).filter(a => siteOf(a.community) === site)
+      (analytics || []).filter(a => siteOf(baseCommunity(a.community)) === site)
     );
   }
   // The app (and its device-id app_open rows) is Foxy Alexx's.
@@ -767,6 +771,82 @@ app.get("/admin/stats", adminAuth, async (req, res) => {
     total_users: users?.length || 0,
     ...combined,
   });
+});
+
+// ─── Outbound-click report (2026-07-27) ───────────────────────────────────
+// Reads back what POST /api/click has been writing since 07-26. Those rows land
+// in `analytics` encoded as:
+//     event     = "click_<placement>__<destination>"
+//     community = "<community>"  or  "<community>|i<feedIndex>"
+// so the report has to decode both. NOTE the community suffix: siteOf() must be
+// given the BASE community or every indexed row would be misfiled to foxyalexx.
+//
+// Same token auth as the rest of /admin/* — no login, no session.
+function splitClickEvent(event) {
+  const rest = event.slice("click_".length);
+  const at = rest.lastIndexOf("__");
+  if (at === -1) return { placement: rest, destination: "unknown" };
+  return { placement: rest.slice(0, at), destination: rest.slice(at + 2) };
+}
+
+function baseCommunity(community) {
+  const c = String(community || "unknown");
+  const bar = c.indexOf("|");
+  return bar === -1 ? c : c.slice(0, bar);
+}
+
+// Sorted [key, count] pairs, biggest first.
+function topPairs(counts, limit) {
+  const pairs = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  return (limit ? pairs.slice(0, limit) : pairs).map(([key, count]) => ({ key, count }));
+}
+
+function summarizeClicks(rows) {
+  const byDestination = {};
+  const byPlacement = {};
+  const byCommunity = {};
+  const byCountry = {};
+  const days = last7DayKeys();
+  const byDay = Object.fromEntries(days.map((d) => [d, 0]));
+  const today = dayKey(new Date());
+  let todayCount = 0;
+
+  rows.forEach((r) => {
+    const { placement, destination } = splitClickEvent(r.event);
+    byDestination[destination] = (byDestination[destination] || 0) + 1;
+    byPlacement[placement] = (byPlacement[placement] || 0) + 1;
+    const community = baseCommunity(r.community);
+    byCommunity[community] = (byCommunity[community] || 0) + 1;
+    if (r.country && r.country !== "unknown") {
+      byCountry[r.country] = (byCountry[r.country] || 0) + 1;
+    }
+    const k = dayKey(r.created_at);
+    if (k in byDay) byDay[k]++;
+    if (k === today) todayCount++;
+  });
+
+  return {
+    total: rows.length,
+    today: todayCount,
+    last7: days.reduce((n, d) => n + byDay[d], 0),
+    by_day: days.map((d) => ({ day: d, count: byDay[d] })),
+    destinations: topPairs(byDestination),
+    placements: topPairs(byPlacement, 25),
+    communities: topPairs(byCommunity),
+    countries: topPairs(byCountry, 15),
+  };
+}
+
+app.get("/admin/clicks", adminAuth, async (req, res) => {
+  const analytics = await fetchAllRows("analytics", "event, community, country, created_at");
+  const clicks = analytics.filter((a) => a.event && a.event.startsWith("click_"));
+
+  const sites = {};
+  for (const site of ["foxyalexx", "maitwerking"]) {
+    sites[site] = summarizeClicks(clicks.filter((c) => siteOf(baseCommunity(c.community)) === site));
+  }
+
+  res.json({ sites, ...summarizeClicks(clicks) });
 });
 
 // ─── NeverBlock anti-adblock proxy ────────────────────────────────────────
