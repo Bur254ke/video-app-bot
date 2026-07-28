@@ -699,7 +699,22 @@ async function transcodeRow(row) {
   transcodeJob.done++;
 }
 
+// PAUSED BY DEFAULT (2026-07-28). Transcoding is lossy and one-way, and the
+// masters it relied on being able to fall back to are gone: every one of the 44
+// rows already repointed to c480/ has NO surviving original — the Supabase→R2
+// migration's orphan cleanup removed them. So a re-run cannot be undone, at all.
+//
+// The job now refuses to start unless settings.transcode_enabled is explicitly
+// "true". Absent or anything else = paused, which is the safe default for a
+// destructive one-way operation that nothing schedules automatically.
 app.post("/admin/transcode", adminAuth, async (req, res) => {
+  const { data: flag } = await supabase.from("settings").select("value").eq("key", "transcode_enabled").maybeSingle();
+  if (flag?.value !== "true") {
+    return res.status(423).json({
+      error: "Transcoding is paused",
+      hint: "Set settings.transcode_enabled to \"true\" to allow it. It is off by default because the re-encode is one-way and the original masters no longer exist.",
+    });
+  }
   if (transcodeJob.running) return res.json({ already_running: true, ...transcodeJob });
 
   const limit = Math.min(Number(req.query.limit) || 500, 2000);
