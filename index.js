@@ -85,6 +85,23 @@ app.post("/api/click", express.text({ type: "*/*", limit: "4kb" }), async (req, 
   res.status(204).end();
 });
 
+// Public read for the sites. Registered BEFORE the /api x-app-secret gate
+// below — the front end fetches this with a plain GET and sends no headers, so
+// behind the gate it answered 401 and every site silently fell back to
+// "all networks on". Deliberately a SEPARATE endpoint from
+// /api/settings, which dumps every settings row: the ad switches are the only
+// part the front end needs, and a narrow endpoint cannot leak a future secret
+// that someone stores in that table.
+app.get("/api/ad-networks", async (req, res) => {
+  const { data } = await supabase.from("settings").select("key, value").in("key", AD_NETWORKS.map((n) => "ads_" + n));
+  const map = {};
+  (data || []).forEach((r) => { map[r.key] = r.value; });
+  const out = {};
+  AD_NETWORKS.forEach((n) => { out[n] = map["ads_" + n] !== "false"; });
+  res.set("Cache-Control", "public, max-age=60");
+  res.json(out);
+});
+
 app.use("/api", (req, res, next) => {
   const secret = req.headers["x-app-secret"];
   if (APP_SECRET && secret !== APP_SECRET) return res.status(403).json({ error: "Unauthorized" });
@@ -999,20 +1016,6 @@ app.post("/admin/ads/networks/:network", adminAuth, async (req, res) => {
   );
   if (error) return res.status(500).json({ error: error.message });
   res.json({ network, enabled: next });
-});
-
-// Public read for the sites. Deliberately a SEPARATE endpoint from
-// /api/settings, which dumps every settings row: the ad switches are the only
-// part the front end needs, and a narrow endpoint cannot leak a future secret
-// that someone stores in that table.
-app.get("/api/ad-networks", async (req, res) => {
-  const { data } = await supabase.from("settings").select("key, value").in("key", AD_NETWORKS.map((n) => "ads_" + n));
-  const map = {};
-  (data || []).forEach((r) => { map[r.key] = r.value; });
-  const out = {};
-  AD_NETWORKS.forEach((n) => { out[n] = map["ads_" + n] !== "false"; });
-  res.set("Cache-Control", "public, max-age=60");
-  res.json(out);
 });
 
 // ─── NeverBlock anti-adblock proxy ────────────────────────────────────────
