@@ -849,6 +849,166 @@ app.get("/admin/clicks", adminAuth, async (req, res) => {
   res.json({ sites, ...summarizeClicks(clicks) });
 });
 
+
+// ─── Adsterra publisher stats (2026-07-28) ────────────────────────────────
+// Server-side proxy, same rule as the ExoClick one above: the API token lives in
+// the backend env and never ships in the admin APK. Verified endpoint:
+//   GET https://api3.adsterratools.com/publisher/stats.json
+//       ?start_date=YYYY-MM-DD&finish_date=YYYY-MM-DD&group_by[]=<dimension>
+//   header: X-API-Key
+// Response: { items: [ { date|placement|country, impression, clicks, ctr, cpm,
+// revenue } ] }. Note the field is "impression", singular — normalised to
+// "impressions" here so every network's rows have the same shape.
+const ADSTERRA_API = "https://api3.adsterratools.com/publisher/stats.json";
+
+async function adsterraStats(groupBy, from, to) {
+  const token = process.env.ADSTERRA_API_TOKEN;
+  if (!token) throw new Error("ADSTERRA_API_TOKEN is not set on the server");
+  const url = `${ADSTERRA_API}?start_date=${from}&finish_date=${to}&group_by[]=${groupBy}`;
+  const r = await fetch(url, { headers: { "X-API-Key": token, Accept: "application/json" } });
+  if (!r.ok) throw new Error(`Adsterra API ${r.status}`);
+  const j = await r.json();
+  return Array.isArray(j.items) ? j.items : [];
+}
+
+function netSum(rows) {
+  const round = (n) => Math.round(n * 1e4) / 1e4;
+  const impressions = rows.reduce((n, r) => n + (r.impression || r.impressions || 0), 0);
+  const clicks = rows.reduce((n, r) => n + (r.clicks || 0), 0);
+  const revenue = rows.reduce((n, r) => n + (r.revenue || 0), 0);
+  return {
+    impressions,
+    clicks,
+    revenue: round(revenue),
+    cpm: round(impressions ? (revenue / impressions) * 1000 : 0),
+    ctr: round(impressions ? (clicks / impressions) * 100 : 0),
+  };
+}
+
+function netShape(rows, key, srcKey) {
+  const round = (n) => Math.round(n * 1e4) / 1e4;
+  return rows.map((r) => ({
+    [key]: r[srcKey || key],
+    impressions: r.impression || r.impressions || 0,
+    clicks: r.clicks || 0,
+    revenue: round(r.revenue || 0),
+    cpm: round(r.cpm || 0),
+  }));
+}
+
+app.get("/admin/adsterra-stats", adminAuth, async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const monthStart = today.slice(0, 8) + "01";
+    const from = req.query.from || monthStart;
+    const to = req.query.to || today;
+    // Adsterra rate-limits, so these run in sequence rather than in parallel.
+    const daily = await adsterraStats("date", from, to);
+    const places = await adsterraStats("placement", from, to);
+    const countries = await adsterraStats("country", from, to);
+    const todayRows = daily.filter((r) => r.date === today);
+    res.json({
+      range: { from, to },
+      today: netSum(todayRows),
+      month: netSum(daily),
+      by_date: netShape(daily, "date").sort((a, b) => (a.date < b.date ? -1 : 1)),
+      by_placement: netShape(places, "placement").sort((a, b) => b.revenue - a.revenue).slice(0, 25),
+      by_country: netShape(countries, "country").sort((a, b) => b.revenue - a.revenue).slice(0, 25),
+    });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// ─── HilltopAds publisher stats ───────────────────────────────────────────
+// NOT wired to a verified endpoint yet. HilltopAds documents its publisher API
+// only behind a login (their /publishers/api page defers to in-account docs), and
+// probing the obvious paths returned their marketing HTML, never JSON. Rather
+// than ship a guessed URL that would fail silently, the request URL is read from
+// config: set HILLTOP_STATS_URL to the ready-made example from
+// My Account → API in the HilltopAds panel, using {from}, {to} and {token} as
+// placeholders, e.g.
+//   https://hilltopads.com/<their path>?key={token}&date_from={from}&date_to={to}
+// The response is passed through untouched, plus a `raw` flag, because the shape
+// is unknown until we see a real one.
+app.get("/admin/hilltop-stats", adminAuth, async (req, res) => {
+  const token = process.env.HILLTOP_API_TOKEN;
+  const tmpl = process.env.HILLTOP_STATS_URL;
+  if (!token) return res.status(501).json({ error: "HILLTOP_API_TOKEN is not set on the server" });
+  if (!tmpl) {
+    return res.status(501).json({
+      error: "HILLTOP_STATS_URL is not configured",
+      hint: "Copy the example request URL from HilltopAds → My Account → API and set it as HILLTOP_STATS_URL, using {token}, {from} and {to} placeholders.",
+    });
+  }
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const from = req.query.from || today.slice(0, 8) + "01";
+    const to = req.query.to || today;
+    const url = tmpl.replace("{token}", encodeURIComponent(token))
+                    .replace("{from}", from).replace("{to}", to);
+    const r = await fetch(url, { headers: { Accept: "application/json" } });
+    const text = await r.text();
+    let body;
+    try { body = JSON.parse(text); } catch (e) {
+      // Their marketing site answers 200 with HTML when the path is wrong, which
+      // would otherwise look like a successful empty response.
+      return res.status(502).json({ error: "HilltopAds returned non-JSON — check HILLTOP_STATS_URL", preview: text.slice(0, 120) });
+    }
+    res.json({ range: { from, to }, raw: true, data: body });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// ─── Per-network ad kill switches (2026-07-28) ────────────────────────────
+// One switch per network so a misbehaving one can be cut without darkening every
+// slot on the site. Stored in `settings` as ads_<network>; absent means ON, so
+// nothing changes for a network that has never been toggled.
+const AD_NETWORKS = ["adsterra", "exoclick", "hilltop"];
+
+app.get("/admin/ads/networks", adminAuth, async (req, res) => {
+  const { data, error } = await supabase.from("settings").select("key, value").in("key", AD_NETWORKS.map((n) => "ads_" + n));
+  if (error) return res.status(500).json({ error: error.message });
+  const map = {};
+  (data || []).forEach((r) => { map[r.key] = r.value; });
+  const out = {};
+  AD_NETWORKS.forEach((n) => { out[n] = map["ads_" + n] !== "false"; });
+  res.json(out);
+});
+
+app.post("/admin/ads/networks/:network", adminAuth, async (req, res) => {
+  const network = String(req.params.network || "").toLowerCase();
+  if (!AD_NETWORKS.includes(network)) return res.status(400).json({ error: "Unknown network" });
+  const key = "ads_" + network;
+  // Explicit `enabled` in the body wins; otherwise flip whatever is stored.
+  let next;
+  if (typeof req.body?.enabled === "boolean") next = req.body.enabled;
+  else {
+    const { data } = await supabase.from("settings").select("value").eq("key", key).maybeSingle();
+    next = data?.value === "false";
+  }
+  const { error } = await supabase.from("settings").upsert(
+    { key, value: String(next), updated_at: new Date().toISOString() }, { onConflict: "key" }
+  );
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ network, enabled: next });
+});
+
+// Public read for the sites. Deliberately a SEPARATE endpoint from
+// /api/settings, which dumps every settings row: the ad switches are the only
+// part the front end needs, and a narrow endpoint cannot leak a future secret
+// that someone stores in that table.
+app.get("/api/ad-networks", async (req, res) => {
+  const { data } = await supabase.from("settings").select("key, value").in("key", AD_NETWORKS.map((n) => "ads_" + n));
+  const map = {};
+  (data || []).forEach((r) => { map[r.key] = r.value; });
+  const out = {};
+  AD_NETWORKS.forEach((n) => { out[n] = map["ads_" + n] !== "false"; });
+  res.set("Cache-Control", "public, max-age=60");
+  res.json(out);
+});
+
 // ─── NeverBlock anti-adblock proxy ────────────────────────────────────────
 // Fetches ExoClick banner ads server-side so ad blockers can't intercept.
 // Frontend calls /api/neverblock?zones=5955418,5957132 and gets back
