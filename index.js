@@ -92,6 +92,47 @@ app.post("/api/click", express.text({ type: "*/*", limit: "4kb" }), async (req, 
 // /api/settings, which dumps every settings row: the ad switches are the only
 // part the front end needs, and a narrow endpoint cannot leak a future secret
 // that someone stores in that table.
+// ─── In-app ad platform switches (2026-07-28) ─────────────────────────────
+// SEPARATE from the ads_<network> switches, which govern the WEBSITES. These
+// control ad surfaces that appear inside the Android apps, per app, so a new
+// in-app format can be cut without touching the sites — and vice versa.
+//
+// Keys are app_ads_<app>_<platform>:
+//   app_ads_foxy_overlay  — boostapp.me interstitial in the Foxy Alexx app
+//   app_ads_mai_overlay   — same format in the Twerking Mai app (different tid)
+// Absent means ON, so a platform that has never been toggled behaves as enabled.
+//
+// The apps read /api/app-ads at launch and honour it before showing anything, so
+// flipping a switch here reaches installed apps without a new APK.
+const APP_AD_PLATFORMS = ["foxy_overlay", "mai_overlay"];
+
+function appAdKey(p) { return "app_ads_" + p; }
+
+async function readAppAds() {
+  const { data } = await supabase.from("settings").select("key, value").in("key", APP_AD_PLATFORMS.map(appAdKey));
+  const map = {};
+  (data || []).forEach((r) => { map[r.key] = r.value; });
+  const out = {};
+  APP_AD_PLATFORMS.forEach((p) => { out[p] = map[appAdKey(p)] !== "false"; });
+  return out;
+}
+
+// Public read for the apps. Registered before the /api x-app-secret gate for the
+// same reason /api/click and /api/ad-networks are: the client sends no headers.
+app.get("/api/app-ads", async (req, res) => {
+  try {
+    const out = await readAppAds();
+    res.set("Cache-Control", "public, max-age=60");
+    res.json(out);
+  } catch (e) {
+    // Fail OPEN on a read error, matching the sites' behaviour: a database blip
+    // must not silently disable every in-app ad.
+    const out = {};
+    APP_AD_PLATFORMS.forEach((p) => { out[p] = true; });
+    res.json(out);
+  }
+});
+
 app.get("/api/ad-networks", async (req, res) => {
   const { data } = await supabase.from("settings").select("key, value").in("key", AD_NETWORKS.map((n) => "ads_" + n));
   const map = {};
@@ -989,6 +1030,27 @@ app.get("/admin/hilltop-stats", adminAuth, async (req, res) => {
 // slot on the site. Stored in `settings` as ads_<network>; absent means ON, so
 // nothing changes for a network that has never been toggled.
 const AD_NETWORKS = ["adsterra", "exoclick", "hilltop"];
+
+app.get("/admin/app-ads", adminAuth, async (req, res) => {
+  try { res.json(await readAppAds()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/admin/app-ads/:platform", adminAuth, async (req, res) => {
+  const platform = String(req.params.platform || "").toLowerCase();
+  if (!APP_AD_PLATFORMS.includes(platform)) return res.status(400).json({ error: "Unknown in-app platform" });
+  let next;
+  if (typeof req.body?.enabled === "boolean") next = req.body.enabled;
+  else {
+    const { data } = await supabase.from("settings").select("value").eq("key", appAdKey(platform)).maybeSingle();
+    next = data?.value === "false";
+  }
+  const { error } = await supabase.from("settings").upsert(
+    { key: appAdKey(platform), value: String(next), updated_at: new Date().toISOString() }, { onConflict: "key" }
+  );
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ platform, enabled: next });
+});
 
 app.get("/admin/ads/networks", adminAuth, async (req, res) => {
   const { data, error } = await supabase.from("settings").select("key, value").in("key", AD_NETWORKS.map((n) => "ads_" + n));
