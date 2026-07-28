@@ -710,6 +710,12 @@ function summarizeSite(videos, analytics) {
     videos_by_community: communityCount,
     most_active_community: mostActive ? mostActive[0] : "none",
     total_views: analytics.length,
+    // APK link clicks for this site (2026-07-28). The real "downloads" figure we
+    // can actually measure: /api/click logs every APK anchor with
+    // destination=apk, so the event name ends in "__apk". This is the honest
+    // metric for maitwerking, whose app carries NO open/version tracking at all —
+    // its mobile_views is structurally near-zero, not genuinely low.
+    app_downloads: analytics.filter(a => typeof a.event === "string" && a.event.startsWith("click_") && a.event.endsWith("__apk")).length,
     views_today: analytics.filter(a => new Date(a.created_at) > new Date(Date.now() - 86400000)).length,
     web_views: analytics.filter(a => a.platform === "web").length,
     mobile_views: analytics.filter(a => a.platform === "mobile").length,
