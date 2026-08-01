@@ -182,11 +182,24 @@ async function fetchAllRows(table, columns) {
 }
 
 async function registerWebhook() {
-  const webhookUrl = `${process.env.WEBHOOK_URL}/webhook`;
-  const res = await fetch(`${TELEGRAM_API}/setWebhook?url=${webhookUrl}`);
-  const data = await res.json();
-  if (data.ok) console.log(`✅ Webhook registered: ${webhookUrl}`);
-  else console.error("❌ Webhook failed:", data.description);
+  const BASE_URL = process.env.WEBHOOK_URL;
+
+  // Main bot (Twerking Mai)
+  const r1 = await fetch(`${TELEGRAM_API}/setWebhook?url=${BASE_URL}/webhook`);
+  const d1 = await r1.json();
+  console.log(d1.ok ? `✅ Main webhook registered` : `❌ Main webhook failed: ${d1.description}`);
+
+  // Foxy Alexx bot
+  const FOXY_API = `https://api.telegram.org/bot${process.env.FOXY_BOT_TOKEN}`;
+  const r2 = await fetch(`${FOXY_API}/setWebhook?url=${BASE_URL}/webhook/foxy`);
+  const d2 = await r2.json();
+  console.log(d2.ok ? `✅ Foxy webhook registered` : `❌ Foxy webhook failed: ${d2.description}`);
+
+  // Wetlooks bot
+  const WETLOOKS_API = `https://api.telegram.org/bot${process.env.WETLOOKS_BOT_TOKEN}`;
+  const r3 = await fetch(`${WETLOOKS_API}/setWebhook?url=${BASE_URL}/webhook/wetlooks`);
+  const d3 = await r3.json();
+  console.log(d3.ok ? `✅ Wetlooks webhook registered` : `❌ Wetlooks webhook failed: ${d3.description}`);
 }
 
 async function tgGetFile(file_id) {
@@ -380,6 +393,83 @@ app.post("/webhook", async (req, res) => {
       );
     }
   }
+});
+// Foxy Alexx bot webhook
+app.post("/webhook/foxy", async (req, res) => {
+  res.sendStatus(200);
+  const update = req.body;
+  const message = update.channel_post;
+  if (!message || !message.video) return;
+  const chatId = String(message.chat.id);
+  const community = communities[chatId];
+  if (!community) { console.log(`⚠️ Foxy webhook — Unknown channel: ${chatId}`); return; }
+  const video = message.video;
+  const file_id = video.file_id;
+  const caption = message.caption || "";
+  const thumbnail_file_id = video.thumbnail?.file_id || null;
+  const FOXY_BOT_TOKEN = process.env.FOXY_BOT_TOKEN;
+  const FOXY_API = `https://api.telegram.org/bot${FOXY_BOT_TOKEN}`;
+
+  const { data: existing } = await supabase
+    .from("videos").select("id").eq("file_id", file_id).eq("community", community).maybeSingle();
+  if (existing) { console.log(`⚠️ Duplicate skipped: ${file_id}`); return; }
+
+  async function getFoxyUrl(fid) {
+    try {
+      const r = await fetch(`${FOXY_API}/getFile?file_id=${fid}`);
+      const d = await r.json();
+      if (!d.ok) return null;
+      return `https://api.telegram.org/file/bot${FOXY_BOT_TOKEN}/${d.result.file_path}`;
+    } catch (e) { return null; }
+  }
+
+  console.log(`🎬 Foxy webhook — New video in [${community}]`);
+  const video_url = await getFoxyUrl(file_id);
+  const thumbnail_url = thumbnail_file_id ? await getFoxyUrl(thumbnail_file_id) : null;
+  const { error } = await supabase.from("videos").insert({ community, file_id, video_url, thumbnail_url, caption });
+  if (error) console.error("❌ Supabase error:", error.message);
+  else {
+    console.log(`✅ Foxy saved → community: ${community}`);
+    const communityLabels = { haul: "Femboys", haul2: "Trending", trans: "Trans" };
+    sendPushToAll(`🦊 New video on Foxy Alexx!`, `Fresh content in ${communityLabels[community] || community}`, { community });
+  }
+});
+
+// Wetlooks bot webhook
+app.post("/webhook/wetlooks", async (req, res) => {
+  res.sendStatus(200);
+  const update = req.body;
+  const message = update.channel_post;
+  if (!message || !message.video) return;
+  const chatId = String(message.chat.id);
+  const community = communities[chatId];
+  if (!community) { console.log(`⚠️ Wetlooks webhook — Unknown channel: ${chatId}`); return; }
+  const video = message.video;
+  const file_id = video.file_id;
+  const caption = message.caption || "";
+  const thumbnail_file_id = video.thumbnail?.file_id || null;
+  const WETLOOKS_BOT_TOKEN = process.env.WETLOOKS_BOT_TOKEN;
+  const WETLOOKS_API = `https://api.telegram.org/bot${WETLOOKS_BOT_TOKEN}`;
+
+  const { data: existing } = await supabase
+    .from("videos").select("id").eq("file_id", file_id).eq("community", community).maybeSingle();
+  if (existing) { console.log(`⚠️ Duplicate skipped: ${file_id}`); return; }
+
+  async function getWetlooksUrl(fid) {
+    try {
+      const r = await fetch(`${WETLOOKS_API}/getFile?file_id=${fid}`);
+      const d = await r.json();
+      if (!d.ok) return null;
+      return `https://api.telegram.org/file/bot${WETLOOKS_BOT_TOKEN}/${d.result.file_path}`;
+    } catch (e) { return null; }
+  }
+
+  console.log(`🎬 Wetlooks webhook — New video in [${community}]`);
+  const video_url = await getWetlooksUrl(file_id);
+  const thumbnail_url = thumbnail_file_id ? await getWetlooksUrl(thumbnail_file_id) : null;
+  const { error } = await supabase.from("videos").insert({ community, file_id, video_url, thumbnail_url, caption });
+  if (error) console.error("❌ Supabase error:", error.message);
+  else console.log(`✅ Wetlooks saved → community: ${community}`);
 });
 
 // Gumroad's "Ping" notification — form-encoded POST, no signature to verify (Gumroad's
