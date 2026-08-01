@@ -1,12 +1,14 @@
 // Map each Telegram channel ID to a community name
-// To add more channels later, just add a new line here
-//
-// 2026-07-16: rewired the two "haul" channels from foxyalexx → twerking-mai.
-// New videos arriving in these channels now land in maitwerking / maitrending.
-// Existing haul/haul2 videos already in the DB keep their community (left as-is).
+// Updated 2026-08-01 — full channel map for both sites
 const communities = {
-  "-1003870438959": "maitwerking", // was "haul" (Femboys, foxyalexx)
-  "-1003859771687": "maitrending", // was "haul2" (Trending, foxyalexx)
-};
+  // Twerking Mai communities
+  "-1003870438959": "maitwerking",
+  "-1003859771687": "maitrending",
+  "-1003823166195": "wetlooks",
 
+  // Foxy Alexx communities
+  "-1002932798127": "haul",
+  "-1003906532971": "trans",
+  "-1003581577500": "haul2",
+};
 module.exports = communities;
