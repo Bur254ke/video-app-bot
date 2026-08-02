@@ -243,6 +243,22 @@ async function getFreshVideoUrl(file_id, botToken = BOT_TOKEN) {
   return `https://api.telegram.org/file/bot${botToken}/${data.result.file_path}`;
 }
 
+// Hard cap for videos we re-host for the web feeds (Foxy + Mai). Telegram's Bot
+// API can still download up to 20MB, but oversized masters kill reel load times
+// and mobile data. Anything over this is skipped — not saved to the DB.
+const MAX_WEB_VIDEO_BYTES = 5 * 1024 * 1024; // 5 MB
+
+function formatBytes(n) {
+  if (!Number.isFinite(n)) return String(n);
+  if (n < 1024) return n + "B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + "KB";
+  return (n / (1024 * 1024)).toFixed(2) + "MB";
+}
+
+function isOverWebVideoLimit(bytes) {
+  return Number.isFinite(bytes) && bytes > MAX_WEB_VIDEO_BYTES;
+}
+
 // Telegram's Bot API caps file downloads at 20MB and returns a hard error for
 // anything bigger ("file is too big") — that is NOT the same as the file being
 // gone, and must never be treated as such by callers deciding whether to delete
@@ -258,10 +274,31 @@ async function downloadTelegramFile(file_id, botToken = BOT_TOKEN) {
   }
   const fileInfo = await tgGetFile(file_id, botToken);
   if (!fileInfo.ok) return { buffer: null, gone: isFileGoneFromTelegram(fileInfo), reason: fileInfo.description };
+  const declared = fileInfo.result && fileInfo.result.file_size;
+  if (isOverWebVideoLimit(declared)) {
+    return {
+      buffer: null,
+      gone: false,
+      reason: `over ${formatBytes(MAX_WEB_VIDEO_BYTES)} web limit (${formatBytes(declared)})`,
+      tooLarge: true,
+      fileSize: declared,
+    };
+  }
   try {
     const res = await fetch(`https://api.telegram.org/file/bot${botToken}/${fileInfo.result.file_path}`);
     if (!res.ok) return { buffer: null, gone: res.status === 404, reason: `HTTP ${res.status}` };
-    return { buffer: Buffer.from(await res.arrayBuffer()), gone: false, reason: null };
+    const buffer = Buffer.from(await res.arrayBuffer());
+    // Defence in depth: Telegram's declared size can be missing; enforce on bytes.
+    if (isOverWebVideoLimit(buffer.length)) {
+      return {
+        buffer: null,
+        gone: false,
+        reason: `over ${formatBytes(MAX_WEB_VIDEO_BYTES)} web limit (${formatBytes(buffer.length)})`,
+        tooLarge: true,
+        fileSize: buffer.length,
+      };
+    }
+    return { buffer, gone: false, reason: null, fileSize: buffer.length };
   } catch (e) {
     return { buffer: null, gone: false, reason: e.message };
   }
@@ -278,18 +315,27 @@ function extensionFromMime(mime, fallback) {
 // Telegram file links — and so the browser can play them at all (Telegram CDN
 // URLs are not a usable public video source for the web reels).
 // botToken is required when the file arrived on a non-main bot (Foxy / Wetlooks).
+// Videos over MAX_WEB_VIDEO_BYTES (5MB) are refused — nothing is uploaded or saved.
 async function persistVideoAssets(community, file_id, thumbnail_file_id, mimeType, botToken = BOT_TOKEN) {
-  const result = { video_url: null, thumbnail_url: null };
+  const result = { video_url: null, thumbnail_url: null, tooLarge: false, reason: null };
 
   const video = await downloadTelegramFile(file_id, botToken);
+  if (video.tooLarge) {
+    result.tooLarge = true;
+    result.reason = video.reason;
+    console.log(`⏭️ Skip oversize video ${file_id}: ${video.reason}`);
+    return result;
+  }
   if (video.buffer) {
     try {
       const ext = extensionFromMime(mimeType, "mp4");
       result.video_url = await uploadFile(`${community}/${file_id}.${ext}`, video.buffer, mimeType || "video/mp4");
     } catch (e) {
       console.error("❌ Video upload to storage failed:", e.message);
+      result.reason = e.message;
     }
   } else if (video.reason) {
+    result.reason = video.reason;
     console.log(`⚠️ Could not fetch video ${file_id}: ${video.reason}`);
   }
 
@@ -331,6 +377,11 @@ async function migrateLegacyVideos() {
       // one. Just skip and retry next cycle; remove only via the admin route.
       skipped++;
       console.log(`⏭️ Skipping ${video.id} [${video.community}] — not deleting (${file.reason})`);
+      continue;
+    }
+    if (file.tooLarge || isOverWebVideoLimit(file.buffer && file.buffer.length)) {
+      skipped++;
+      console.log(`⏭️ Skipping ${video.id} [${video.community}] — over ${formatBytes(MAX_WEB_VIDEO_BYTES)} web limit`);
       continue;
     }
     try {
@@ -391,10 +442,22 @@ app.post("/webhook", async (req, res) => {
     return;
   }
 
+  // Telegram includes file_size on the message — reject before download when possible.
+  if (isOverWebVideoLimit(video.file_size)) {
+    console.log(
+      `⏭️ Skip [${community}] ${file_id} — ${formatBytes(video.file_size)} > ${formatBytes(MAX_WEB_VIDEO_BYTES)} web limit`
+    );
+    return;
+  }
+
   console.log(`🎬 New video in [${community}]`);
-  const { video_url, thumbnail_url } = await persistVideoAssets(community, file_id, thumbnail_file_id, video.mime_type);
+  const { video_url, thumbnail_url, tooLarge } = await persistVideoAssets(community, file_id, thumbnail_file_id, video.mime_type);
   if (!video_url) {
-    console.error(`❌ Could not persist video ${file_id} to storage — skipping save`);
+    console.error(
+      tooLarge
+        ? `⏭️ Oversize video ${file_id} — not saved to web`
+        : `❌ Could not persist video ${file_id} to storage — skipping save`
+    );
     return;
   }
   const { error } = await supabase.from("videos").insert({ community, file_id, video_url, thumbnail_url, caption });
@@ -452,12 +515,23 @@ app.post("/webhook/foxy", async (req, res) => {
     .from("videos").select("id").eq("file_id", file_id).eq("community", community).maybeSingle();
   if (existing) { console.log(`⚠️ Foxy duplicate skipped: ${file_id}`); return; }
 
+  if (isOverWebVideoLimit(video.file_size)) {
+    console.log(
+      `⏭️ Foxy skip [${community}] ${file_id} — ${formatBytes(video.file_size)} > ${formatBytes(MAX_WEB_VIDEO_BYTES)} web limit`
+    );
+    return;
+  }
+
   console.log(`🎬 Foxy webhook — New video in [${community}]`);
-  const { video_url, thumbnail_url } = await persistVideoAssets(
+  const { video_url, thumbnail_url, tooLarge } = await persistVideoAssets(
     community, file_id, thumbnail_file_id, video.mime_type, FOXY_BOT_TOKEN
   );
   if (!video_url) {
-    console.error(`❌ Foxy — could not persist video ${file_id} to storage — skipping save`);
+    console.error(
+      tooLarge
+        ? `⏭️ Foxy oversize ${file_id} — not saved to web`
+        : `❌ Foxy — could not persist video ${file_id} to storage — skipping save`
+    );
     return;
   }
   const { error } = await supabase.from("videos").insert({ community, file_id, video_url, thumbnail_url, caption });
@@ -491,12 +565,23 @@ app.post("/webhook/wetlooks", async (req, res) => {
     .from("videos").select("id").eq("file_id", file_id).eq("community", community).maybeSingle();
   if (existing) { console.log(`⚠️ Wetlooks duplicate skipped: ${file_id}`); return; }
 
+  if (isOverWebVideoLimit(video.file_size)) {
+    console.log(
+      `⏭️ Wetlooks skip [${community}] ${file_id} — ${formatBytes(video.file_size)} > ${formatBytes(MAX_WEB_VIDEO_BYTES)} web limit`
+    );
+    return;
+  }
+
   console.log(`🎬 Wetlooks webhook — New video in [${community}]`);
-  const { video_url, thumbnail_url } = await persistVideoAssets(
+  const { video_url, thumbnail_url, tooLarge } = await persistVideoAssets(
     community, file_id, thumbnail_file_id, video.mime_type, WETLOOKS_BOT_TOKEN
   );
   if (!video_url) {
-    console.error(`❌ Wetlooks — could not persist video ${file_id} to storage — skipping save`);
+    console.error(
+      tooLarge
+        ? `⏭️ Wetlooks oversize ${file_id} — not saved to web`
+        : `❌ Wetlooks — could not persist video ${file_id} to storage — skipping save`
+    );
     return;
   }
   const { error } = await supabase.from("videos").insert({ community, file_id, video_url, thumbnail_url, caption });

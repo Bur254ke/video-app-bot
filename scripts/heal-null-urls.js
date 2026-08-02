@@ -78,8 +78,14 @@ async function healOne(row) {
     return { ok: false, reason: "getFile: " + e.message };
   }
   if (!info.ok) return { ok: false, reason: info.description || "getFile failed" };
-  if (info.result.file_size && info.result.file_size > 19 * 1024 * 1024) {
-    return { ok: false, reason: "file too big for Bot API (" + info.result.file_size + " bytes)" };
+  // Match the web upload cap in index.js (5 MB). Oversized masters are never
+  // re-hosted for the feeds.
+  const MAX_WEB_VIDEO_BYTES = 5 * 1024 * 1024;
+  if (info.result.file_size && info.result.file_size > MAX_WEB_VIDEO_BYTES) {
+    return {
+      ok: false,
+      reason: "over 5MB web limit (" + info.result.file_size + " bytes)",
+    };
   }
 
   const filePath = info.result.file_path;
