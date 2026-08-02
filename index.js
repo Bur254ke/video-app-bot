@@ -46,9 +46,23 @@ app.use(cors({
 }));
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const FOXY_BOT_TOKEN = process.env.FOXY_BOT_TOKEN || "";
+const WETLOOKS_BOT_TOKEN = process.env.WETLOOKS_BOT_TOKEN || "";
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "Mbuki@2030.";
 const APP_SECRET = process.env.APP_SECRET || "";
+
+// file_id values are bot-scoped: only the bot that received a message can
+// call getFile on it. Foxy / Wetlooks channel posts arrive on separate bots,
+// so download + re-host must use that bot's token — not the main BOT_TOKEN.
+const FOXY_COMMUNITIES = new Set(["haul", "haul2", "trans"]);
+const WETLOOKS_COMMUNITIES = new Set(["wetlooks"]);
+
+function tokenForCommunity(community) {
+  if (FOXY_COMMUNITIES.has(community)) return FOXY_BOT_TOKEN || BOT_TOKEN;
+  if (WETLOOKS_COMMUNITIES.has(community)) return WETLOOKS_BOT_TOKEN || BOT_TOKEN;
+  return BOT_TOKEN;
+}
 
 function adminAuth(req, res, next) {
   const token = req.headers["x-admin-token"];
@@ -183,6 +197,10 @@ async function fetchAllRows(table, columns) {
 
 async function registerWebhook() {
   const BASE_URL = process.env.WEBHOOK_URL;
+  if (!BASE_URL) {
+    console.error("❌ WEBHOOK_URL is not set — cannot register Telegram webhooks");
+    return;
+  }
 
   // Main bot (Twerking Mai)
   const r1 = await fetch(`${TELEGRAM_API}/setWebhook?url=${BASE_URL}/webhook`);
@@ -190,31 +208,39 @@ async function registerWebhook() {
   console.log(d1.ok ? `✅ Main webhook registered` : `❌ Main webhook failed: ${d1.description}`);
 
   // Foxy Alexx bot
-  const FOXY_API = `https://api.telegram.org/bot${process.env.FOXY_BOT_TOKEN}`;
-  const r2 = await fetch(`${FOXY_API}/setWebhook?url=${BASE_URL}/webhook/foxy`);
-  const d2 = await r2.json();
-  console.log(d2.ok ? `✅ Foxy webhook registered` : `❌ Foxy webhook failed: ${d2.description}`);
+  if (FOXY_BOT_TOKEN) {
+    const FOXY_API = `https://api.telegram.org/bot${FOXY_BOT_TOKEN}`;
+    const r2 = await fetch(`${FOXY_API}/setWebhook?url=${BASE_URL}/webhook/foxy`);
+    const d2 = await r2.json();
+    console.log(d2.ok ? `✅ Foxy webhook registered` : `❌ Foxy webhook failed: ${d2.description}`);
+  } else {
+    console.warn("⚠️ Skipping Foxy webhook registration — FOXY_BOT_TOKEN not set");
+  }
 
   // Wetlooks bot
-  const WETLOOKS_API = `https://api.telegram.org/bot${process.env.WETLOOKS_BOT_TOKEN}`;
-  const r3 = await fetch(`${WETLOOKS_API}/setWebhook?url=${BASE_URL}/webhook/wetlooks`);
-  const d3 = await r3.json();
-  console.log(d3.ok ? `✅ Wetlooks webhook registered` : `❌ Wetlooks webhook failed: ${d3.description}`);
+  if (WETLOOKS_BOT_TOKEN) {
+    const WETLOOKS_API = `https://api.telegram.org/bot${WETLOOKS_BOT_TOKEN}`;
+    const r3 = await fetch(`${WETLOOKS_API}/setWebhook?url=${BASE_URL}/webhook/wetlooks`);
+    const d3 = await r3.json();
+    console.log(d3.ok ? `✅ Wetlooks webhook registered` : `❌ Wetlooks webhook failed: ${d3.description}`);
+  } else {
+    console.warn("⚠️ Skipping Wetlooks webhook registration — WETLOOKS_BOT_TOKEN not set");
+  }
 }
 
-async function tgGetFile(file_id) {
+async function tgGetFile(file_id, botToken = BOT_TOKEN) {
   try {
-    const res = await fetch(`${TELEGRAM_API}/getFile?file_id=${file_id}`);
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${file_id}`);
     return await res.json();
   } catch (e) {
     return { ok: false, description: e.message };
   }
 }
 
-async function getFreshVideoUrl(file_id) {
-  const data = await tgGetFile(file_id);
+async function getFreshVideoUrl(file_id, botToken = BOT_TOKEN) {
+  const data = await tgGetFile(file_id, botToken);
   if (!data.ok) return null;
-  return `https://api.telegram.org/file/bot${BOT_TOKEN}/${data.result.file_path}`;
+  return `https://api.telegram.org/file/bot${botToken}/${data.result.file_path}`;
 }
 
 // Telegram's Bot API caps file downloads at 20MB and returns a hard error for
@@ -226,11 +252,14 @@ function isFileGoneFromTelegram(getFileResponse) {
   return desc.includes("file not found") || desc.includes("wrong file_id") || desc.includes("file_id is invalid");
 }
 
-async function downloadTelegramFile(file_id) {
-  const fileInfo = await tgGetFile(file_id);
+async function downloadTelegramFile(file_id, botToken = BOT_TOKEN) {
+  if (!botToken) {
+    return { buffer: null, gone: false, reason: "missing bot token" };
+  }
+  const fileInfo = await tgGetFile(file_id, botToken);
   if (!fileInfo.ok) return { buffer: null, gone: isFileGoneFromTelegram(fileInfo), reason: fileInfo.description };
   try {
-    const res = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`);
+    const res = await fetch(`https://api.telegram.org/file/bot${botToken}/${fileInfo.result.file_path}`);
     if (!res.ok) return { buffer: null, gone: res.status === 404, reason: `HTTP ${res.status}` };
     return { buffer: Buffer.from(await res.arrayBuffer()), gone: false, reason: null };
   } catch (e) {
@@ -245,12 +274,14 @@ function extensionFromMime(mime, fallback) {
 }
 
 // Downloads the video (and thumbnail) from Telegram once and re-hosts them in
-// Supabase Storage, so playback no longer depends on the source message still
-// existing on Telegram (which is what was breaking videos on web + app).
-async function persistVideoAssets(community, file_id, thumbnail_file_id, mimeType) {
+// permanent storage (R2 / Supabase), so playback no longer depends on expiring
+// Telegram file links — and so the browser can play them at all (Telegram CDN
+// URLs are not a usable public video source for the web reels).
+// botToken is required when the file arrived on a non-main bot (Foxy / Wetlooks).
+async function persistVideoAssets(community, file_id, thumbnail_file_id, mimeType, botToken = BOT_TOKEN) {
   const result = { video_url: null, thumbnail_url: null };
 
-  const video = await downloadTelegramFile(file_id);
+  const video = await downloadTelegramFile(file_id, botToken);
   if (video.buffer) {
     try {
       const ext = extensionFromMime(mimeType, "mp4");
@@ -263,7 +294,7 @@ async function persistVideoAssets(community, file_id, thumbnail_file_id, mimeTyp
   }
 
   if (thumbnail_file_id) {
-    const thumb = await downloadTelegramFile(thumbnail_file_id);
+    const thumb = await downloadTelegramFile(thumbnail_file_id, botToken);
     if (thumb.buffer) {
       try {
         result.thumbnail_url = await uploadFile(`${community}/${file_id}_thumb.jpg`, thumb.buffer, "image/jpeg");
@@ -277,11 +308,10 @@ async function persistVideoAssets(community, file_id, thumbnail_file_id, mimeTyp
 }
 
 // One-off (self-repeating) migration for videos saved before permanent storage
-// existed. Anything still pointing at a Telegram file link gets re-downloaded
-// and re-hosted. A row is only ever removed when Telegram explicitly confirms
-// the file is gone (isFileGoneFromTelegram) — every other failure (too big,
-// rate limited, network blip, etc.) leaves the row untouched. Deleting on any
-// failure is exactly what caused every video to disappear in production once.
+// existed — including Foxy/Wetlooks rows that were inserted with null
+// video_url (temporary Telegram URL path, or getFile failures that still
+// wrote a row). Uses the bot token that owns each community's file_ids.
+// A row is only ever removed via the admin route — never auto-deleted here.
 async function migrateLegacyVideos() {
   const { data: videos } = await supabase.from("videos").select("id, community, video_url, file_id");
   if (!videos) return;
@@ -291,7 +321,8 @@ async function migrateLegacyVideos() {
   console.log(`🔄 Migrating ${legacy.length} legacy video(s) to permanent storage...`);
   let migrated = 0, skipped = 0;
   for (const video of legacy) {
-    const file = await downloadTelegramFile(video.file_id);
+    const botToken = tokenForCommunity(video.community);
+    const file = await downloadTelegramFile(video.file_id, botToken);
     if (!file.buffer) {
       // 2026-07-16: NEVER auto-delete rows. Previously a Telegram-confirmed
       // "file gone" pruned the row — but source channels deleting old posts
@@ -299,13 +330,14 @@ async function migrateLegacyVideos() {
       // stale row (worst case a non-playing legacy video) over ever losing
       // one. Just skip and retry next cycle; remove only via the admin route.
       skipped++;
-      console.log(`⏭️ Skipping ${video.id} — not deleting (${file.reason})`);
+      console.log(`⏭️ Skipping ${video.id} [${video.community}] — not deleting (${file.reason})`);
       continue;
     }
     try {
       const url = await uploadFile(`${video.community}/${video.file_id}.mp4`, file.buffer, "video/mp4");
       await supabase.from("videos").update({ video_url: url }).eq("id", video.id);
       migrated++;
+      console.log(`✅ Migrated ${video.id} [${video.community}] → ${url.slice(0, 80)}`);
     } catch (e) {
       console.error(`❌ Migration upload failed for ${video.id}:`, e.message);
     }
@@ -395,6 +427,10 @@ app.post("/webhook", async (req, res) => {
   }
 });
 // Foxy Alexx bot webhook
+// 2026-08-02 fix: previously stored temporary Telegram file URLs (or null when
+// getFile failed) and still inserted the row. The web feed then listed videos
+// with no playable src. Mirror the main webhook: download via FOXY_BOT_TOKEN,
+// re-host to permanent storage, skip insert if that fails.
 app.post("/webhook/foxy", async (req, res) => {
   res.sendStatus(200);
   const update = req.body;
@@ -403,29 +439,27 @@ app.post("/webhook/foxy", async (req, res) => {
   const chatId = String(message.chat.id);
   const community = communities[chatId];
   if (!community) { console.log(`⚠️ Foxy webhook — Unknown channel: ${chatId}`); return; }
+  if (!FOXY_BOT_TOKEN) {
+    console.error("❌ Foxy webhook — FOXY_BOT_TOKEN is not set; cannot download file_ids");
+    return;
+  }
   const video = message.video;
   const file_id = video.file_id;
   const caption = message.caption || "";
   const thumbnail_file_id = video.thumbnail?.file_id || null;
-  const FOXY_BOT_TOKEN = process.env.FOXY_BOT_TOKEN;
-  const FOXY_API = `https://api.telegram.org/bot${FOXY_BOT_TOKEN}`;
 
   const { data: existing } = await supabase
     .from("videos").select("id").eq("file_id", file_id).eq("community", community).maybeSingle();
-  if (existing) { console.log(`⚠️ Duplicate skipped: ${file_id}`); return; }
-
-  async function getFoxyUrl(fid) {
-    try {
-      const r = await fetch(`${FOXY_API}/getFile?file_id=${fid}`);
-      const d = await r.json();
-      if (!d.ok) return null;
-      return `https://api.telegram.org/file/bot${FOXY_BOT_TOKEN}/${d.result.file_path}`;
-    } catch (e) { return null; }
-  }
+  if (existing) { console.log(`⚠️ Foxy duplicate skipped: ${file_id}`); return; }
 
   console.log(`🎬 Foxy webhook — New video in [${community}]`);
-  const video_url = await getFoxyUrl(file_id);
-  const thumbnail_url = thumbnail_file_id ? await getFoxyUrl(thumbnail_file_id) : null;
+  const { video_url, thumbnail_url } = await persistVideoAssets(
+    community, file_id, thumbnail_file_id, video.mime_type, FOXY_BOT_TOKEN
+  );
+  if (!video_url) {
+    console.error(`❌ Foxy — could not persist video ${file_id} to storage — skipping save`);
+    return;
+  }
   const { error } = await supabase.from("videos").insert({ community, file_id, video_url, thumbnail_url, caption });
   if (error) console.error("❌ Supabase error:", error.message);
   else {
@@ -435,7 +469,7 @@ app.post("/webhook/foxy", async (req, res) => {
   }
 });
 
-// Wetlooks bot webhook
+// Wetlooks bot webhook — same permanent-storage path as main/Foxy.
 app.post("/webhook/wetlooks", async (req, res) => {
   res.sendStatus(200);
   const update = req.body;
@@ -444,32 +478,38 @@ app.post("/webhook/wetlooks", async (req, res) => {
   const chatId = String(message.chat.id);
   const community = communities[chatId];
   if (!community) { console.log(`⚠️ Wetlooks webhook — Unknown channel: ${chatId}`); return; }
+  if (!WETLOOKS_BOT_TOKEN) {
+    console.error("❌ Wetlooks webhook — WETLOOKS_BOT_TOKEN is not set; cannot download file_ids");
+    return;
+  }
   const video = message.video;
   const file_id = video.file_id;
   const caption = message.caption || "";
   const thumbnail_file_id = video.thumbnail?.file_id || null;
-  const WETLOOKS_BOT_TOKEN = process.env.WETLOOKS_BOT_TOKEN;
-  const WETLOOKS_API = `https://api.telegram.org/bot${WETLOOKS_BOT_TOKEN}`;
 
   const { data: existing } = await supabase
     .from("videos").select("id").eq("file_id", file_id).eq("community", community).maybeSingle();
-  if (existing) { console.log(`⚠️ Duplicate skipped: ${file_id}`); return; }
-
-  async function getWetlooksUrl(fid) {
-    try {
-      const r = await fetch(`${WETLOOKS_API}/getFile?file_id=${fid}`);
-      const d = await r.json();
-      if (!d.ok) return null;
-      return `https://api.telegram.org/file/bot${WETLOOKS_BOT_TOKEN}/${d.result.file_path}`;
-    } catch (e) { return null; }
-  }
+  if (existing) { console.log(`⚠️ Wetlooks duplicate skipped: ${file_id}`); return; }
 
   console.log(`🎬 Wetlooks webhook — New video in [${community}]`);
-  const video_url = await getWetlooksUrl(file_id);
-  const thumbnail_url = thumbnail_file_id ? await getWetlooksUrl(thumbnail_file_id) : null;
+  const { video_url, thumbnail_url } = await persistVideoAssets(
+    community, file_id, thumbnail_file_id, video.mime_type, WETLOOKS_BOT_TOKEN
+  );
+  if (!video_url) {
+    console.error(`❌ Wetlooks — could not persist video ${file_id} to storage — skipping save`);
+    return;
+  }
   const { error } = await supabase.from("videos").insert({ community, file_id, video_url, thumbnail_url, caption });
   if (error) console.error("❌ Supabase error:", error.message);
-  else console.log(`✅ Wetlooks saved → community: ${community}`);
+  else {
+    console.log(`✅ Wetlooks saved → community: ${community}`);
+    sendWebPushToAll(
+      "maitwerking",
+      "New video on Twerking Mai 🍑",
+      "Fresh content in WET💦LOOKS — tap to watch",
+      `/community/${community}`
+    );
+  }
 });
 
 // Gumroad's "Ping" notification — form-encoded POST, no signature to verify (Gumroad's
@@ -542,12 +582,18 @@ app.get("/api/videos/:community", async (req, res) => {
     .from("videos")
     .select("*")
     .eq("community", req.params.community)
+    // Hide rows that never got a permanent URL (Foxy/Wetlooks bug before 2026-08-02).
+    // Those rows still exist for migrateLegacyVideos to heal; the feed just shouldn't
+    // render empty players for them.
+    .not("video_url", "is", null)
     .order("created_at", { ascending });
   if (limit !== null) q = q.range(offset, offset + limit - 1);
 
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ videos: data });
+  // Defence in depth: also drop empty-string / non-http URLs if any slipped in.
+  const videos = (data || []).filter((v) => v.video_url && /^https?:\/\//i.test(v.video_url));
+  res.json({ videos });
 });
 
 function rotateVideos(videos) {
@@ -591,10 +637,12 @@ app.get("/api/videos", async (req, res) => {
   const { data, error } = await supabase
     .from("videos")
     .select("*")
+    .not("video_url", "is", null)
     .order("created_at", { ascending: false })
     .limit(50);
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ videos: rotateVideos(data) });
+  const videos = (data || []).filter((v) => v.video_url && /^https?:\/\//i.test(v.video_url));
+  res.json({ videos: rotateVideos(videos) });
 });
 
 app.get("/api/settings", async (req, res) => {
@@ -710,6 +758,17 @@ async function migrateRowToR2(row) {
     if (error) throw new Error(`DB update: ${error.message}`);
   }
 }
+
+// Force a pass of the legacy → permanent-storage migrator (null / Telegram URLs).
+// Safe to call repeatedly; only heals rows that still lack a permanent URL.
+app.post("/admin/migrate-legacy", adminAuth, async (req, res) => {
+  res.json({ started: true, message: "Legacy migration started in background" });
+  try {
+    await migrateLegacyVideos();
+  } catch (e) {
+    console.error("❌ migrate-legacy failed:", e.message);
+  }
+});
 
 app.post("/admin/migrate-r2", adminAuth, async (req, res) => {
   if (!process.env.R2_BUCKET) return res.status(400).json({ error: "R2 env vars not set" });
@@ -1378,8 +1437,12 @@ const PORT = process.env.PORT || 4000;
 app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🔐 Admin token: ${ADMIN_SECRET}`);
+  console.log(`🤖 Bots: main=${BOT_TOKEN ? "set" : "MISSING"} foxy=${FOXY_BOT_TOKEN ? "set" : "MISSING"} wetlooks=${WETLOOKS_BOT_TOKEN ? "set" : "MISSING"}`);
+  if (!FOXY_BOT_TOKEN) console.warn("⚠️ FOXY_BOT_TOKEN missing — Foxy channel videos cannot be downloaded/re-hosted");
+  if (!WETLOOKS_BOT_TOKEN) console.warn("⚠️ WETLOOKS_BOT_TOKEN missing — Wetlooks videos cannot be downloaded/re-hosted");
   await registerWebhook();
-  setTimeout(migrateLegacyVideos, 2 * 60 * 1000);
+  // Heal null-URL Foxy/Wetlooks rows soon after boot (was 2 min; now 15s).
+  setTimeout(migrateLegacyVideos, 15 * 1000);
   setInterval(migrateLegacyVideos, 60 * 60 * 1000);
   scheduleDailyReminder();
 });
