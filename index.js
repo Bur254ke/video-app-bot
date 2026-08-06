@@ -1233,52 +1233,294 @@ app.get("/admin/adsterra-stats", adminAuth, async (req, res) => {
   }
 });
 
-// ─── HilltopAds publisher stats ───────────────────────────────────────────
-// NOT wired to a verified endpoint yet. HilltopAds documents its publisher API
-// only behind a login (their /publishers/api page defers to in-account docs), and
-// probing the obvious paths returned their marketing HTML, never JSON. Rather
-// than ship a guessed URL that would fail silently, the request URL is read from
-// config: set HILLTOP_STATS_URL to the ready-made example from
-// My Account → API in the HilltopAds panel, using {from}, {to} and {token} as
-// placeholders, e.g.
-//   https://hilltopads.com/<their path>?key={token}&date_from={from}&date_to={to}
-// The response is passed through untouched, plus a `raw` flag, because the shape
-// is unknown until we see a real one.
+// ─── HilltopAds publisher stats (verified 2026-08-06) ─────────────────────
+// GET https://api.hilltopads.com/publisher/listStats
+//   ?key=<token>&date=YYYY-MM-DD&date2=YYYY-MM-DD&siteID=<id>&group=date
+// Response:
+//   { status:"success", result: { "YYYY-MM-DD": [ { revenue, impressions, clicks, cpm } ] } }
+// Site ID 910503 = foxyalexx.online (HILLTOP_SITE_ID).
 app.get("/admin/hilltop-stats", adminAuth, async (req, res) => {
   const token = process.env.HILLTOP_API_TOKEN;
-  const tmpl = process.env.HILLTOP_STATS_URL;
   if (!token) return res.status(501).json({ error: "HILLTOP_API_TOKEN is not set on the server" });
-  if (!tmpl) {
-    return res.status(501).json({
-      error: "HILLTOP_STATS_URL is not configured",
-      hint: "Copy the example request URL from HilltopAds → My Account → API and set it as HILLTOP_STATS_URL, using {token}, {from} and {to} placeholders.",
-    });
-  }
   try {
     const today = new Date().toISOString().slice(0, 10);
     const from = req.query.from || today.slice(0, 8) + "01";
     const to = req.query.to || today;
-    const url = tmpl.replace("{token}", encodeURIComponent(token))
-                    .replace("{from}", from).replace("{to}", to);
-    const r = await fetch(url, { headers: { Accept: "application/json" } });
-    const text = await r.text();
-    let body;
-    try { body = JSON.parse(text); } catch (e) {
-      // Their marketing site answers 200 with HTML when the path is wrong, which
-      // would otherwise look like a successful empty response.
-      return res.status(502).json({ error: "HilltopAds returned non-JSON — check HILLTOP_STATS_URL", preview: text.slice(0, 120) });
+    const siteId = req.query.siteID || process.env.HILLTOP_SITE_ID || "910503";
+    const qs = new URLSearchParams({
+      key: token,
+      date: from,
+      date2: to,
+      siteID: String(siteId),
+      group: "date",
+    });
+    const r = await fetch(`https://api.hilltopads.com/publisher/listStats?${qs}`, {
+      headers: { Accept: "application/json" },
+    });
+    const body = await r.json().catch(() => null);
+    if (!r.ok || !body || body.status !== "success") {
+      return res.status(502).json({
+        error: `HilltopAds ${r.status}`,
+        preview: body,
+      });
     }
-    res.json({ range: { from, to }, raw: true, data: body });
+    const byDate = [];
+    const result = body.result || {};
+    for (const date of Object.keys(result).sort()) {
+      const rows = Array.isArray(result[date]) ? result[date] : [result[date]];
+      let impressions = 0, clicks = 0, revenue = 0;
+      for (const row of rows) {
+        impressions += Number(row?.impressions) || 0;
+        clicks += Number(row?.clicks) || 0;
+        revenue += Number(row?.revenue) || 0;
+      }
+      const cpm = impressions ? (revenue / impressions) * 1000 : 0;
+      byDate.push({
+        date,
+        impressions,
+        clicks,
+        revenue: Math.round(revenue * 1e4) / 1e4,
+        cpm: Math.round(cpm * 1e4) / 1e4,
+      });
+    }
+    const todayRows = byDate.filter((d) => d.date === today);
+    res.json({
+      range: { from, to },
+      site_id: siteId,
+      today: netSum(todayRows.map((d) => ({ impression: d.impressions, clicks: d.clicks, revenue: d.revenue, cpm: d.cpm }))),
+      month: netSum(byDate.map((d) => ({ impression: d.impressions, clicks: d.clicks, revenue: d.revenue, cpm: d.cpm }))),
+      by_date: byDate,
+    });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
 });
 
+// ─── PopAds publisher stats (key on POPADS_API_KEY) ───────────────────────
+// POST https://www.popads.net/api/report_publisher
+// Accept: application/json. Requires zone=UTC + quick/start/end + optional groups.
+app.get("/admin/popads-stats", adminAuth, async (req, res) => {
+  const key = process.env.POPADS_API_KEY;
+  if (!key) return res.status(501).json({ error: "POPADS_API_KEY is not set on the server" });
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const from = req.query.from || today.slice(0, 8) + "01";
+    const to = req.query.to || today;
+    const body = new URLSearchParams({
+      key,
+      zone: "UTC",
+      start: `${from} 00:00`,
+      end: `${to} 23:59`,
+      groups: "datetime:day",
+      orders: "datetime:asc",
+    });
+    if (req.query.websites) body.set("websites", String(req.query.websites));
+    const r = await fetch("https://www.popads.net/api/report_publisher", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: body.toString(),
+    });
+    const text = await r.text();
+    let j;
+    try { j = JSON.parse(text); } catch (e) {
+      return res.status(502).json({ error: "PopAds returned non-JSON", preview: text.slice(0, 160) });
+    }
+    if (!r.ok || j.errors) {
+      return res.status(502).json({ error: "PopAds report failed", detail: j.errors || j });
+    }
+    const rows = Array.isArray(j.rows) ? j.rows : [];
+    const byDate = rows.map((row) => {
+      const impressions = Number(row.impressions) || 0;
+      const clicks = Number(row.clicks) || 0;
+      const revenue = Number(row.revenue) || 0;
+      return {
+        date: String(row.datetime || row.date || "").slice(0, 10),
+        impressions,
+        clicks,
+        revenue: Math.round(revenue * 1e4) / 1e4,
+        cpm: Math.round((impressions ? (revenue / impressions) * 1000 : 0) * 1e4) / 1e4,
+      };
+    }).sort((a, b) => (a.date < b.date ? -1 : 1));
+    const todayRows = byDate.filter((d) => d.date === today);
+    res.json({
+      range: { from, to },
+      mode: j.mode || "publisher",
+      websites: j.websites || [],
+      today: netSum(todayRows.map((d) => ({ impression: d.impressions, clicks: d.clicks, revenue: d.revenue }))),
+      month: netSum(byDate.map((d) => ({ impression: d.impressions, clicks: d.clicks, revenue: d.revenue }))),
+      by_date: byDate,
+    });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// ─── AdCash publisher stats ───────────────────────────────────────────────
+// Client API: https://api.myadcash.com/api
+// Auth: Authorization: Bearer <ADCASH_API_TOKEN> (token from AdCash → API Tokens).
+// Per-website filters use the publisher website IDs:
+//   1635298 foxynline · 1636468 foxyalexx · 1636484 Maitwerking
+const ADCASH_SITES = {
+  foxynline: 1635298,
+  foxyalexx: 1636468,
+  maitwerking: 1636484,
+};
+
+async function adcashFetch(path, query) {
+  const token = process.env.ADCASH_API_TOKEN;
+  if (!token) throw new Error("ADCASH_API_TOKEN is not set on the server");
+  const qs = new URLSearchParams(query || {});
+  const url = `https://api.myadcash.com/api${path}${qs.toString() ? `?${qs}` : ""}`;
+  const r = await fetch(url, {
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+  });
+  const text = await r.text();
+  let body;
+  try { body = JSON.parse(text); } catch (e) {
+    throw new Error(`AdCash non-JSON (${r.status}): ${text.slice(0, 120)}`);
+  }
+  if (!r.ok) {
+    const msg = body?.message || body?.error || body?.name || `HTTP ${r.status}`;
+    throw new Error(`AdCash ${r.status}: ${msg}`);
+  }
+  return body;
+}
+
+function adcashNormalizeRows(body) {
+  // Accept several response shapes the Client API has used across versions.
+  const list =
+    Array.isArray(body) ? body
+    : Array.isArray(body?.data) ? body.data
+    : Array.isArray(body?.items) ? body.items
+    : Array.isArray(body?.statistics) ? body.statistics
+    : Array.isArray(body?.result) ? body.result
+    : [];
+  return list.map((row) => {
+    const impressions = Number(row.impressions ?? row.impression ?? row.imps ?? 0) || 0;
+    const clicks = Number(row.clicks ?? row.click ?? 0) || 0;
+    const revenue = Number(row.revenue ?? row.earnings ?? row.income ?? 0) || 0;
+    const date = String(row.date ?? row.day ?? row.datetime ?? row.period ?? "").slice(0, 10);
+    const websiteId = row.website_id ?? row.websiteId ?? row.site_id ?? row.website ?? null;
+    const websiteName = row.website_name ?? row.websiteName ?? row.name ?? null;
+    return {
+      date,
+      website_id: websiteId,
+      website_name: websiteName,
+      impressions,
+      clicks,
+      revenue: Math.round(revenue * 1e4) / 1e4,
+      cpm: Math.round((impressions ? (revenue / impressions) * 1000 : 0) * 1e4) / 1e4,
+    };
+  });
+}
+
+app.get("/admin/adcash-stats", adminAuth, async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const from = req.query.from || today.slice(0, 8) + "01";
+    const to = req.query.to || today;
+    const siteKey = String(req.query.site || "").toLowerCase();
+    const websiteId = req.query.website_id
+      || (ADCASH_SITES[siteKey] ? String(ADCASH_SITES[siteKey]) : "")
+      || "";
+    const publisherId = process.env.ADCASH_PUBLISHER_ID || websiteId || "";
+
+    // Try publisher-scoped path first (documented as
+    // GET /v1/publishers/<id>/statistics), then account-level statistics.
+    const query = {
+      date_from: from,
+      date_to: to,
+      group_by: "date",
+    };
+    if (websiteId) query.website_id = websiteId;
+
+    let body;
+    const attempts = [];
+    if (publisherId) {
+      attempts.push(`/v1/publishers/${encodeURIComponent(publisherId)}/statistics`);
+    }
+    attempts.push("/v1/publishers/statistics");
+    attempts.push("/v1/publisher/statistics");
+
+    let lastErr = null;
+    for (const path of attempts) {
+      try {
+        body = await adcashFetch(path, query);
+        lastErr = null;
+        break;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    if (lastErr && !body) throw lastErr;
+
+    let byDate = adcashNormalizeRows(body).filter((r) => r.date);
+    if (!byDate.length && body && typeof body === "object" && !Array.isArray(body)) {
+      // Map-shaped daily object: { "2026-08-01": { revenue, impressions, ... } }
+      byDate = Object.keys(body)
+        .filter((k) => /^\d{4}-\d{2}-\d{2}$/.test(k))
+        .sort()
+        .map((date) => {
+          const row = body[date];
+          const impressions = Number(row?.impressions ?? row?.impression ?? 0) || 0;
+          const clicks = Number(row?.clicks ?? 0) || 0;
+          const revenue = Number(row?.revenue ?? row?.earnings ?? 0) || 0;
+          return {
+            date,
+            impressions,
+            clicks,
+            revenue: Math.round(revenue * 1e4) / 1e4,
+            cpm: Math.round((impressions ? (revenue / impressions) * 1000 : 0) * 1e4) / 1e4,
+          };
+        });
+    }
+
+    byDate.sort((a, b) => (a.date < b.date ? -1 : 1));
+    const todayRows = byDate.filter((d) => d.date === today);
+    res.json({
+      range: { from, to },
+      site: siteKey || null,
+      website_id: websiteId || null,
+      sites: ADCASH_SITES,
+      today: netSum(todayRows.map((d) => ({ impression: d.impressions, clicks: d.clicks, revenue: d.revenue }))),
+      month: netSum(byDate.map((d) => ({ impression: d.impressions, clicks: d.clicks, revenue: d.revenue }))),
+      by_date: byDate,
+      raw: byDate.length ? undefined : body,
+    });
+  } catch (e) {
+    const status = /not set on the server/.test(e.message) ? 501 : 502;
+    res.status(status).json({
+      error: e.message,
+      hint: status === 501
+        ? "Set ADCASH_API_TOKEN on the server (AdCash panel → API Tokens). Optionally ADCASH_PUBLISHER_ID if stats need the account id."
+        : undefined,
+      sites: ADCASH_SITES,
+    });
+  }
+});
+
 // ─── Per-network ad kill switches (2026-07-28) ────────────────────────────
-// One switch per network so a misbehaving one can be cut without darkening every
-// slot on the site. Stored in `settings` as ads_<network>; absent means ON, so
-// nothing changes for a network that has never been toggled.
-const AD_NETWORKS = ["adsterra", "exoclick", "hilltop"];
+// One switch per network / AdCash website so a misbehaving unit can be cut
+// without darkening every slot. Stored in `settings` as ads_<network>; absent
+// means ON. AdCash is per-website (independent buttons in the admin app):
+//   adcash_foxynline  · 1635298
+//   adcash_foxyalexx  · 1636468
+//   adcash_maitwerking · 1636484
+const AD_NETWORKS = [
+  "adsterra",
+  "exoclick",
+  "hilltop",
+  "popads",
+  "adcash_foxynline",
+  "adcash_foxyalexx",
+  "adcash_maitwerking",
+];
 
 app.get("/admin/app-ads", adminAuth, async (req, res) => {
   try { res.json(await readAppAds()); }
