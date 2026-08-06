@@ -1517,6 +1517,8 @@ const AD_NETWORKS = [
   "exoclick",
   "hilltop",
   "popads",
+  "monetag",
+  "admaven",
   "adcash_foxynline",
   "adcash_foxyalexx",
   "adcash_maitwerking",
